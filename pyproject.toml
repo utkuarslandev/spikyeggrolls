@@ -1,0 +1,37 @@
+[project]
+name = "spikyeggroll"
+version = "0.1.0"
+description = "Spiking neural networks in JAX with the EGGROLL algorithm"
+requires-python = ">=3.11"
+dependencies = [
+    "jax>=0.4.20",
+    "jaxlib>=0.4.20",
+    "optax>=0.1.7",
+    "tonic",
+    "h5py",
+    "numpy>=1.24",
+    "matplotlib>=3.7",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.1.0",
+]
+tracking = [
+    "wandb",
+]
+
+[tool.setuptools.packages.find]
+include = ["spikyeggroll*"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 88
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

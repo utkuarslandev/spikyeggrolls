@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# JAX/ML
+*.npy
+*.npz
+*.pkl
+*.ckpt
+wandb/
+logs/
+checkpoints/
+
+# External dependencies (installed locally)
+HyperscaleES/
+
+# Data (downloaded at runtime)
+/data/
+
+# Generated
+plots/
