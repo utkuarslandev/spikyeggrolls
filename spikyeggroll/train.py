@@ -52,7 +52,7 @@ def save_checkpoint(
         "epoch": epoch,
         "params": _tree_to_numpy(params),
         "noiser_params": _tree_to_numpy(noiser_params),
-        "data_key": _tree_to_numpy(data_key),
+        "data_key": np.asarray(jax.random.key_data(data_key)),
         "ema_success": ema_success,
         "best_test_acc": best_test_acc,
         "best_epoch": best_epoch,
@@ -70,7 +70,7 @@ def load_checkpoint(path: str):
         payload = pickle.load(fh)
     payload["params"] = _tree_to_jax(payload["params"])
     payload["noiser_params"] = _tree_to_jax(payload["noiser_params"])
-    payload["data_key"] = _tree_to_jax(payload["data_key"])
+    payload["data_key"] = jax.random.wrap_key_data(jnp.asarray(payload["data_key"]))
     return payload
 
 
