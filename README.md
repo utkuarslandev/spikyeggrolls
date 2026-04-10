@@ -31,7 +31,7 @@ Fitness: negative cross-entropy on spike counts. All weight matrices optimized v
 # Setup
 git clone https://github.com/ESHyperscale/HyperscaleES
 uv venv
-uv pip install -e ".[cuda12]"
+uv pip install -e ".[cuda13]"
 uv pip install -e HyperscaleES/
 
 # Train (best config, ~60 min on RTX 4080)
@@ -65,9 +65,10 @@ make smoke-runpod
 Both paths run the same Python training entry point through environment profiles in
 `env/local.env` and `env/runpod.env`.
 
-The default bootstrap path targets NVIDIA CUDA 12 environments. For a non-Runpod
-local setup, override `SPIKYEGGROLL_INSTALL_TARGET` if you need a different JAX
-install target.
+The default Runpod bootstrap path now targets NVIDIA CUDA 13 environments, which
+matches current high-end Runpod GPUs better. Use `.[cuda12]` explicitly if you need
+an older fallback. For a non-Runpod local setup, override
+`SPIKYEGGROLL_INSTALL_TARGET` if you need a different JAX install target.
 
 Long-running jobs now emit:
 

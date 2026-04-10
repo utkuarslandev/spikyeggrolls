@@ -27,7 +27,7 @@ make bootstrap-runpod
 ```
 
 By default the bootstrap script clones `HyperscaleES` into `/workspace/HyperscaleES`,
-creates `.venv`, installs this repo with the `cuda12` extra, installs
+creates `.venv`, installs this repo with the `cuda13` extra, installs
 `HyperscaleES`, and then runs a hard-failing doctor check that requires a non-CPU
 JAX device.
 
@@ -85,6 +85,12 @@ Override the sibling `HyperscaleES` checkout:
 HYPERSCALEES_DIR=/workspace/custom/HyperscaleES make bootstrap-runpod
 ```
 
+Force the older JAX CUDA 12 wheels if a Pod image or driver stack needs them:
+
+```bash
+SPIKYEGGROLL_INSTALL_TARGET='.[cuda12]' make bootstrap-runpod
+```
+
 Override training parameters for a run:
 
 ```bash
@@ -103,6 +109,8 @@ RUN_NAME=my-run RESUME_FROM=/workspace/checkpoints/spikyeggroll/my-run-last.pkl 
   sibling checkout at `/workspace/HyperscaleES`.
 - `torch` and `torchvision` are required because MNIST loading is implemented via
   `torchvision.datasets.MNIST`.
+- Runpod now defaults to the JAX `cuda13` extra. Use `SPIKYEGGROLL_INSTALL_TARGET='.[cuda12]'`
+  if you need the older CUDA 12 wheels.
 - The Runpod bootstrap now fails if JAX only sees CPU devices. That is intentional.
 - The default full run is expensive. Use `make smoke-runpod` first to verify the Pod,
   CUDA, and dataset path before scaling up.
