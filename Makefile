@@ -1,6 +1,7 @@
 PROFILE ?= local
+RUNPOD_EXEC ?= bash scripts/pod_exec.sh
 
-.PHONY: bootstrap-local bootstrap-runpod doctor smoke tune full doctor-local doctor-runpod smoke-local smoke-runpod tune-local tune-runpod full-local full-runpod
+.PHONY: bootstrap-local bootstrap-runpod doctor smoke tune full doctor-local doctor-runpod smoke-local smoke-runpod tune-local tune-runpod full-local full-runpod pod-doctor pod-smoke pod-tune pod-full pod-pull
 
 bootstrap-local:
 	bash scripts/bootstrap_local.sh
@@ -43,3 +44,18 @@ full-local:
 
 full-runpod:
 	PROFILE=runpod bash scripts/run_full.sh
+
+pod-pull:
+	$(RUNPOD_EXEC) git pull --ff-only
+
+pod-doctor:
+	$(RUNPOD_EXEC) make doctor-runpod
+
+pod-smoke:
+	$(RUNPOD_EXEC) make smoke-runpod
+
+pod-tune:
+	$(RUNPOD_EXEC) make tune-runpod
+
+pod-full:
+	$(RUNPOD_EXEC) make full-runpod

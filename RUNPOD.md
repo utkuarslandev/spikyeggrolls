@@ -57,6 +57,41 @@ make full-runpod
 All run scripts write logs under `/workspace/logs/spikyeggroll/`.
 Each run also writes structured metrics and checkpoints using the shared run name.
 
+## Session checklist (cost + speed)
+
+Use this loop for daily iteration:
+
+1. Start the pod in Runpod.
+2. Connect over SSH.
+3. Sync code and validate environment.
+4. Run smoke or tune.
+5. Stop or terminate the pod when done.
+
+Example command chain after SSH:
+
+```bash
+cd /workspace/spikyeggrolls
+git pull --ff-only
+make doctor-runpod
+make smoke-runpod
+```
+
+For long runs, use `tmux` so disconnects do not kill training:
+
+```bash
+tmux new -s train
+cd /workspace/spikyeggrolls
+make tune-runpod
+```
+
+Detach with `Ctrl-b d`, reattach with `tmux attach -t train`.
+
+Cost controls that matter most:
+
+- Stop the pod when no training is active.
+- Use a cheaper GPU tier for smoke tests; move up only for long runs.
+- Keep repo, venv, data, and JAX cache under `/workspace` to avoid repeated bootstrap/JIT cost.
+
 ## Environment
 
 The `runpod` profile sets these defaults:
@@ -103,10 +138,55 @@ Resume from the most recent checkpoint:
 RUN_NAME=my-run RESUME_FROM=/workspace/checkpoints/spikyeggroll/my-run-last.pkl make tune-runpod
 ```
 
+## Faster SSH workflow from your laptop
+
+### Option A: SSH config alias
+
+Add an alias to `~/.ssh/config` and update only the port when the pod restarts:
+
+```sshconfig
+Host runpod-spiky
+    HostName 210.164.16.102
+    User root
+    Port 14605
+    IdentityFile ~/.ssh/id_ed25519
+    StrictHostKeyChecking accept-new
+```
+
+Then connect with:
+
+```bash
+ssh runpod-spiky
+```
+
+### Option B: Make targets over SSH
+
+This repo includes `scripts/pod_exec.sh` and helper targets:
+
+```bash
+cp env/runpod.ssh.env.example env/runpod.ssh.env
+# edit host/port/key for your current pod
+
+make pod-pull
+make pod-doctor
+make pod-smoke
+```
+
+Available remote targets:
+
+- `make pod-pull`
+- `make pod-doctor`
+- `make pod-smoke`
+- `make pod-tune`
+- `make pod-full`
+
+`env/runpod.ssh.env` is gitignored. Keep SSH endpoint details there or in shell env vars.
+
 ## Notes
 
 - `HyperscaleES` is still an external dependency. The bootstrap path assumes a
-  sibling checkout at `/workspace/HyperscaleES`.
+  workspace-level checkout at `/workspace/HyperscaleES` (local bootstrap defaults
+  to `../HyperscaleES`).
 - `torch` and `torchvision` are required because MNIST loading is implemented via
   `torchvision.datasets.MNIST`.
 - Runpod now defaults to the JAX `cuda13` extra. Use `SPIKYEGGROLL_INSTALL_TARGET='.[cuda12]'`

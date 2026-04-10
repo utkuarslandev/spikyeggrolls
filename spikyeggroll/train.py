@@ -217,8 +217,9 @@ def train(cfg: SNNConfig = None):
         )
     )
 
-    # Evaluate test set in chunks (same batch size as training to reuse JIT cache)
-    n_test_chunks = test_data.shape[0] // cfg.batch_size  # drop remainder to avoid recompile
+    # Evaluate test set in fixed-size chunks (same batch size as training).
+    # Note: remainder samples are intentionally dropped to avoid shape-triggered recompiles.
+    n_test_chunks = test_data.shape[0] // cfg.batch_size
     def eval_test():
         all_preds = []
         for i in range(n_test_chunks):

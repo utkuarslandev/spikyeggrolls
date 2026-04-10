@@ -45,3 +45,5 @@ plots/
 # Keep checked-in environment profiles
 !env/
 !env/*.env
+env/runpod.ssh.env
+env/runpod.local.env

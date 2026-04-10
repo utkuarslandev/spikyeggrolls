@@ -29,10 +29,16 @@ Fitness: negative cross-entropy on spike counts. All weight matrices optimized v
 
 ```bash
 # Setup
+cd ..
 git clone https://github.com/ESHyperscale/HyperscaleES
+cd spikyeggrolls
 uv venv
 uv pip install -e ".[cuda13]"
-uv pip install -e HyperscaleES/
+uv pip install -e ../HyperscaleES/
+
+# Optional GPU installs (choose one based on your machine/runtime)
+# uv pip install -e ".[cuda12]"
+# uv pip install -e ".[cuda13]"
 
 # Train (best config, ~60 min on RTX 4080)
 .venv/bin/python -m spikyeggroll.train \
@@ -69,6 +75,9 @@ The default Runpod bootstrap path now targets NVIDIA CUDA 13 environments, which
 matches current high-end Runpod GPUs better. Use `.[cuda12]` explicitly if you need
 an older fallback. For a non-Runpod local setup, override
 `SPIKYEGGROLL_INSTALL_TARGET` if you need a different JAX install target.
+By default, local bootstrap expects `HyperscaleES` at `../HyperscaleES` while
+Runpod bootstrap expects `/workspace/HyperscaleES`; override `HYPERSCALEES_DIR`
+if your checkout is elsewhere.
 
 Long-running jobs now emit:
 
@@ -76,6 +85,10 @@ Long-running jobs now emit:
 - structured metrics in `LOG_DIR/<run_name>.metrics.jsonl`
 - a final summary in `LOG_DIR/<run_name>.summary.json`
 - checkpoints in `CHECKPOINT_DIR/<run_name>-{last,best,interrupt}.pkl`
+
+Evaluation note: test accuracy is computed in fixed-size chunks using the training
+batch size; when `10000 % batch_size != 0`, the final partial chunk is dropped to
+avoid extra JIT recompiles.
 
 ## Key findings
 
@@ -90,7 +103,7 @@ See [docs/baseline-validation.md](docs/baseline-validation.md) for full experime
 ## Dependencies
 
 - JAX (with GPU support)
-- [HyperscaleES](https://github.com/ESHyperscale/HyperscaleES) — EGGROLL evolution strategy framework (clone into repo root)
+- [HyperscaleES](https://github.com/ESHyperscale/HyperscaleES) — EGGROLL evolution strategy framework (clone as sibling path `../HyperscaleES`, or set `HYPERSCALEES_DIR`)
 - torch + torchvision (for MNIST download)
 - optax
 
