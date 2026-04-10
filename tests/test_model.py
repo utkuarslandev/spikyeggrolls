@@ -6,6 +6,7 @@ import jax.numpy as jnp
 
 from spikyeggroll.configs import SNNConfig
 from spikyeggroll.models.snn import SNNModel
+from spikyeggroll.models.spiking_resnet import SpikingResNet18Model
 
 
 def test_rand_init_structure():
@@ -31,3 +32,24 @@ def test_rand_init_shapes():
     assert params["linear1"]["weight"].shape == (32, 16)
     assert params["linear2"]["weight"].shape == (32, 32)
     assert params["linear_out"]["weight"].shape == (5, 32)
+
+
+def test_spiking_resnet_init_structure():
+    """SpikingResNet18 init should expose stem/output and residual block params."""
+    key = jax.random.key(7)
+    cfg = SNNConfig(
+        dataset="cifar10",
+        model_name="spiking_resnet18",
+        n_inputs=3072,
+        n_classes=10,
+        resnet_width=128,
+        resnet_blocks=2,
+    )
+    frozen_params, params, _, _ = SpikingResNet18Model.rand_init(key, cfg)
+    assert "linear1" in params
+    assert "linear_out" in params
+    assert "block0_a" in params
+    assert "block1_b" in params
+    assert params["linear1"]["weight"].shape == (128, 3072)
+    assert params["linear_out"]["weight"].shape == (10, 128)
+    assert frozen_params["resnet_blocks"] == 2

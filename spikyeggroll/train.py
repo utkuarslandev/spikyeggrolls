@@ -18,7 +18,9 @@ from hyperscalees.models.common import simple_es_tree_key
 
 from spikyeggroll.configs import SNNConfig
 from spikyeggroll.models.snn import SNNModel
+from spikyeggroll.models.spiking_resnet import SpikingResNet18Model
 from spikyeggroll.data.mnist import load_mnist, encode_batch
+from spikyeggroll.data.cifar10 import load_cifar10, encode_batch as encode_cifar_batch
 
 
 def _tree_to_numpy(tree):
@@ -95,6 +97,34 @@ def compute_fitness(spike_counts, labels):
     return -ce
 
 
+def _get_dataset_ops(cfg: SNNConfig):
+    if cfg.dataset == "mnist":
+        return (
+            lambda: load_mnist(cfg.data_path + "/mnist"),
+            encode_batch,
+            784,
+            1,
+            28,
+        )
+    if cfg.dataset == "cifar10":
+        return (
+            lambda: load_cifar10(cfg.data_path + "/cifar10", augment=cfg.augment),
+            encode_cifar_batch,
+            32 * 32 * 3,
+            3,
+            32,
+        )
+    raise ValueError(f"Unsupported dataset '{cfg.dataset}'.")
+
+
+def _get_model_cls(cfg: SNNConfig):
+    if cfg.model_name == "mlp_snn":
+        return SNNModel
+    if cfg.model_name == "spiking_resnet18":
+        return SpikingResNet18Model
+    raise ValueError(f"Unsupported model_name '{cfg.model_name}'.")
+
+
 def train(cfg: SNNConfig = None):
     """Run EGGROLL training.
 
@@ -121,8 +151,10 @@ def train(cfg: SNNConfig = None):
     es_key = jax.random.fold_in(key, 1)
     data_key = jax.random.fold_in(key, 2)
 
+    model_cls = _get_model_cls(cfg)
+
     # Initialize model
-    frozen_params, params, scan_map, es_map = SNNModel.rand_init(model_key, cfg)
+    frozen_params, params, scan_map, es_map = model_cls.rand_init(model_key, cfg)
     es_tree_key = simple_es_tree_key(params, es_key, scan_map)
 
     # Initialize EGGROLL noiser
@@ -161,9 +193,18 @@ def train(cfg: SNNConfig = None):
         )
 
     # Load dataset
-    train_data, train_labels, test_data, test_labels = load_mnist(
-        cfg.data_path + "/mnist"
-    )
+    load_data_fn, encode_batch_fn, default_n_inputs, default_channels, default_img = _get_dataset_ops(cfg)
+    train_data, train_labels, test_data, test_labels = load_data_fn()
+    if cfg.in_channels != default_channels or cfg.image_size != default_img:
+        print(
+            f"Warning: cfg image settings ({cfg.in_channels}ch, {cfg.image_size}px) "
+            f"differ from dataset defaults ({default_channels}ch, {default_img}px)."
+        )
+    if cfg.n_inputs != default_n_inputs:
+        print(
+            f"Warning: cfg.n_inputs={cfg.n_inputs} differs from dataset default "
+            f"{default_n_inputs}. Using cfg value."
+        )
     _timesteps = cfg.timesteps
     _batch_size = cfg.batch_size
 
@@ -172,13 +213,18 @@ def train(cfg: SNNConfig = None):
         k1, k2 = jax.random.split(key)
         indices = jax.random.choice(k1, images.shape[0], shape=(_batch_size,), replace=False)
         batch_imgs = images[indices]
-        probs = batch_imgs[:, None, :]
-        uniform = jax.random.uniform(k2, (batch_imgs.shape[0], _timesteps, batch_imgs.shape[1]))
-        spikes = (uniform < probs).astype(jnp.float32)
+        spikes = encode_batch_fn(batch_imgs, _timesteps, k2)
         return spikes, labels[indices]
 
     print(f"Dataset: {cfg.dataset} | train: {train_data.shape}, test: {test_data.shape}")
-    print(f"Architecture: {cfg.n_inputs}-{cfg.hidden_size}-{cfg.hidden_size}-{cfg.n_classes}")
+    print(f"Model: {cfg.model_name}")
+    if cfg.model_name == "mlp_snn":
+        print(f"Architecture: {cfg.n_inputs}-{cfg.hidden_size}-{cfg.hidden_size}-{cfg.n_classes}")
+    else:
+        print(
+            f"Architecture: residual_snn width={cfg.resnet_width} blocks={cfg.resnet_blocks} "
+            f"in={cfg.n_inputs} classes={cfg.n_classes}"
+        )
     print(f"EGGROLL: pop={N}, rank={cfg.rank}, sigma={cfg.sigma}, lr={cfg.lr}")
     print(f"Run: {cfg.run_name} | metrics: {metrics_path} | checkpoints: {checkpoint_dir}")
 
@@ -194,7 +240,7 @@ def train(cfg: SNNConfig = None):
     # vmap over iterinfo only — input batch and l1_base shared across population
     jit_forward = jax.jit(
         jax.vmap(
-            lambda n, p, i, x, l1b: SNNModel.forward(
+            lambda n, p, i, x, l1b: model_cls.forward(
                 EggRoll, frozen_noiser_params, n,
                 frozen_params, p, es_tree_key, i, x, l1b
             ),
@@ -204,7 +250,7 @@ def train(cfg: SNNConfig = None):
 
     # JIT-compiled forward: evaluation (no noise, iterinfo=None)
     jit_forward_eval = jax.jit(
-        lambda n, p, x: SNNModel.forward(
+        lambda n, p, x: model_cls.forward(
             EggRoll, frozen_noiser_params, n,
             frozen_params, p, es_tree_key, None, x
         )
@@ -219,17 +265,24 @@ def train(cfg: SNNConfig = None):
 
     # Evaluate test set in fixed-size chunks (same batch size as training).
     # Note: remainder samples are intentionally dropped to avoid shape-triggered recompiles.
-    n_test_chunks = test_data.shape[0] // cfg.batch_size
+    eval_test_size = test_data.shape[0]
+    if cfg.num_test_eval_samples and cfg.num_test_eval_samples > 0:
+        eval_test_size = min(eval_test_size, cfg.num_test_eval_samples)
+    n_test_chunks = eval_test_size // cfg.batch_size
+
     def eval_test():
+        if n_test_chunks == 0:
+            return float("nan")
         all_preds = []
         for i in range(n_test_chunks):
             start = i * cfg.batch_size
             te_chunk = test_data[start:start+cfg.batch_size]
             te_key = jax.random.fold_in(jax.random.key(999), i)
-            te_spikes = encode_batch(te_chunk, cfg.timesteps, te_key)
+            te_spikes = encode_batch_fn(te_chunk, cfg.timesteps, te_key)
             out = jit_forward_eval(noiser_params, params, te_spikes)
             all_preds.append(jnp.argmax(out, axis=-1))
-        return float(jnp.mean(jnp.concatenate(all_preds) == test_labels[:n_test_chunks * cfg.batch_size]))
+        end = n_test_chunks * cfg.batch_size
+        return float(jnp.mean(jnp.concatenate(all_preds) == test_labels[:end]))
 
     write_metric(
         metrics_path,
@@ -259,8 +312,10 @@ def train(cfg: SNNConfig = None):
             val_out = jit_forward_eval(noiser_params, params, x_batch)
             val_fitness = compute_fitness(val_out, y_batch)
 
-            # Precompute layer 1 base matmul (shared across population)
-            l1_base = compute_l1_base(params, x_batch)
+            # Precompute layer 1 base matmul when model exposes linear1
+            l1_base = None
+            if "linear1" in params:
+                l1_base = compute_l1_base(params, x_batch)
 
             # Evaluate population (with noise) — chunked to fit in GPU memory
             if cfg.chunk_size > 0 and cfg.chunk_size < N:
@@ -426,8 +481,12 @@ def train(cfg: SNNConfig = None):
 
 def main():
     parser = argparse.ArgumentParser(description="Train SNN with EGGROLL")
+    parser.add_argument("--dataset", type=str, default="mnist", choices=["mnist", "cifar10"])
+    parser.add_argument("--model_name", type=str, default="mlp_snn", choices=["mlp_snn", "spiking_resnet18"])
     parser.add_argument("--N", type=int, default=None, help="Override n_inputs")
     parser.add_argument("--hidden_size", type=int, default=128)
+    parser.add_argument("--resnet_width", type=int, default=768)
+    parser.add_argument("--resnet_blocks", type=int, default=8)
     parser.add_argument("--pop_size", type=int, default=256)
     parser.add_argument("--rank", type=int, default=1)
     parser.add_argument("--sigma", type=float, default=0.02)
@@ -443,6 +502,10 @@ def main():
     parser.add_argument("--escape_beta", type=float, default=50.0)
     parser.add_argument("--escape_lambda0", type=float, default=1.0)
     parser.add_argument("--data_path", type=str, default="data")
+    parser.add_argument("--in_channels", type=int, default=None)
+    parser.add_argument("--image_size", type=int, default=None)
+    parser.add_argument("--augment", action="store_true")
+    parser.add_argument("--num_test_eval_samples", type=int, default=0)
     parser.add_argument("--run_name", type=str, default="default")
     parser.add_argument("--log_dir", type=str, default="logs/spikyeggroll")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints/spikyeggroll")
@@ -452,13 +515,24 @@ def main():
     parser.add_argument("--checkpoint_interval", type=int, default=100)
     args = parser.parse_args()
 
-    n_inputs = args.N or 784
+    dataset_defaults = {
+        "mnist": {"n_inputs": 784, "in_channels": 1, "image_size": 28},
+        "cifar10": {"n_inputs": 3072, "in_channels": 3, "image_size": 32},
+    }
+    dflt = dataset_defaults[args.dataset]
+    n_inputs = args.N or dflt["n_inputs"]
     n_classes = 10
     timesteps = args.timesteps or 25
+    in_channels = args.in_channels or dflt["in_channels"]
+    image_size = args.image_size or dflt["image_size"]
 
     cfg = SNNConfig(
+        dataset=args.dataset,
+        model_name=args.model_name,
         n_inputs=n_inputs,
         hidden_size=args.hidden_size,
+        resnet_width=args.resnet_width,
+        resnet_blocks=args.resnet_blocks,
         n_classes=n_classes,
         timesteps=timesteps,
         pop_size=args.pop_size,
@@ -475,6 +549,10 @@ def main():
         escape_lambda0=args.escape_lambda0,
         seed=args.seed,
         data_path=args.data_path,
+        in_channels=in_channels,
+        image_size=image_size,
+        augment=args.augment,
+        num_test_eval_samples=args.num_test_eval_samples,
         run_name=args.run_name,
         log_dir=args.log_dir,
         checkpoint_dir=args.checkpoint_dir,

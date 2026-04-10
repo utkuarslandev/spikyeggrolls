@@ -11,6 +11,7 @@ class SNNConfig:
     hidden_size: int = 128
     n_classes: int = 10
     timesteps: int = 25
+    model_name: str = "mlp_snn"
 
     # LIF neuron
     beta: float = 0.95
@@ -39,6 +40,14 @@ class SNNConfig:
     dataset: str = "mnist"
     data_path: str = "data"
     dtype: str = "float32"
+    in_channels: int = 1
+    image_size: int = 28
+    augment: bool = False
+    num_test_eval_samples: int = 0
+
+    # ResNet-style deep spiking MLP options (CIFAR-10 path)
+    resnet_width: int = 768
+    resnet_blocks: int = 8
 
     # Run artifacts
     run_name: str = "default"

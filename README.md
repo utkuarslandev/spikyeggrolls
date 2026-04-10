@@ -23,7 +23,7 @@ Input [B, 25, 784]  (Poisson rate-coded MNIST, T=25 timesteps)
   → spike count readout → argmax → classification
 ```
 
-ok nowFitness: negative cross-entropy on spike counts. All weight matrices optimized via low-rank (rank-3) EGGROLL perturbations with AdamW.
+Fitness: negative cross-entropy on spike counts. All weight matrices optimized via low-rank (rank-3) EGGROLL perturbations with AdamW.
 
 ## Quick start
 
@@ -33,12 +33,12 @@ cd ..
 git clone https://github.com/ESHyperscale/HyperscaleES
 cd spikyeggrolls
 uv venv
-uv pip install -e ".[cuda13]"
+uv pip install -e ".[cuda12]"
 uv pip install -e ../HyperscaleES/
 
-# Optional GPU installs (choose one based on your machine/runtime)
-# uv pip install -e ".[cuda12]"
+# Optional: other JAX install targets (match your driver / GPU)
 # uv pip install -e ".[cuda13]"
+# uv pip install -e ".[cpu]"
 
 # Train (best config, ~60 min on RTX 4080)
 .venv/bin/python -m spikyeggroll.train \
@@ -47,6 +47,12 @@ uv pip install -e ../HyperscaleES/
 # Quick test (~45s)
 .venv/bin/python -m spikyeggroll.train \
   --pop_size 1024 --rank 2 --epochs 50
+
+# CIFAR-10 deep scaling smoke (spiking ResNet18-style model)
+.venv/bin/python -m spikyeggroll.train \
+  --dataset cifar10 --model_name spiking_resnet18 \
+  --pop_size 256 --rank 2 --sigma 0.01 --lr 0.002 --epochs 3 \
+  --timesteps 4 --batch_size 64 --chunk_size 128
 
 # Run tests
 .venv/bin/python -m pytest tests/ -v
@@ -66,15 +72,19 @@ make smoke-local
 make bootstrap-runpod
 make doctor-runpod
 make smoke-runpod
+
+# CIFAR-10 + spiking_resnet18 through launcher
+DATASET=cifar10 MODEL_NAME=spiking_resnet18 make smoke-runpod
 ```
 
 Both paths run the same Python training entry point through environment profiles in
 `env/local.env` and `env/runpod.env`.
 
-The default Runpod bootstrap path now targets NVIDIA CUDA 13 environments, which
-matches current high-end Runpod GPUs better. Use `.[cuda12]` explicitly if you need
-an older fallback. For a non-Runpod local setup, override
-`SPIKYEGGROLL_INSTALL_TARGET` if you need a different JAX install target.
+Local bootstrap defaults to the JAX `cuda12` extra via `env/local.env`, and
+`REQUIRE_ACCELERATOR=1` so `make doctor-local` fails if JAX only sees CPU (training
+is intended to run on GPU). For CPU-only machines, set `REQUIRE_ACCELERATOR=0` or
+install with `.[cpu]`. Runpod defaults to `cuda13` via `env/runpod.env`. Override
+`SPIKYEGGROLL_INSTALL_TARGET` if you need a different JAX wheel.
 By default, local bootstrap expects `HyperscaleES` at `../HyperscaleES` while
 Runpod bootstrap expects `/workspace/HyperscaleES`; override `HYPERSCALEES_DIR`
 if your checkout is elsewhere.
@@ -106,6 +116,23 @@ Preset defaults in `scripts/run_train.sh`:
 | smoke  | 512      | 2    | 0.02  | 0.005 | 30   | 128        | 256        |
 | tune   | 2048     | 2    | 0.01  | 0.005 | 100  | 256        | 512        |
 | full   | 10000    | 3    | 0.007 | 0.001 | 4000 | 256        | 1024       |
+
+For CIFAR-10 deep runs, set `DATASET=cifar10 MODEL_NAME=spiking_resnet18`.
+The launcher also applies CIFAR-friendly defaults when those are selected:
+`TIMESTEPS=4`, `BATCH_SIZE=64`, `CHUNK_SIZE=128` (unless explicitly overridden).
+
+Population-scaling sweep example (6 settings, 3 seeds each):
+
+```bash
+for POP in 256 512 1024 2048 4096 8192; do
+  for SEED in 0 1 2; do
+    DATASET=cifar10 MODEL_NAME=spiking_resnet18 \
+    POP_SIZE=$POP RANK=2 SIGMA=0.01 LR=0.002 EPOCHS=50 TIMESTEPS=4 \
+    RUN_NAME="cifar10-resnet18-pop${POP}-s${SEED}" \
+    make tune-local -- --seed $SEED
+  done
+done
+```
 
 ## Key findings
 

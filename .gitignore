@@ -47,3 +47,8 @@ plots/
 !env/*.env
 env/runpod.ssh.env
 env/runpod.local.env
+
+
+
+.jax_cache/
+.cursor/

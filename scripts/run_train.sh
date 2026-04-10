@@ -75,10 +75,20 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 : "${LOG_INTERVAL:=10}"
 : "${TEST_INTERVAL:=100}"
 : "${CHECKPOINT_INTERVAL:=100}"
+: "${DATASET:=mnist}"
+: "${MODEL_NAME:=mlp_snn}"
 LOG_FILE="${LOG_DIR}/${RUN_NAME}.stdout.log"
+
+if [ "${DATASET}" = "cifar10" ] && [ "${MODEL_NAME}" = "spiking_resnet18" ]; then
+    : "${TIMESTEPS:=4}"
+    : "${BATCH_SIZE:=64}"
+    : "${CHUNK_SIZE:=128}"
+fi
 
 echo "Profile: ${PROFILE}"
 echo "Preset: ${PRESET}"
+echo "Dataset: ${DATASET}"
+echo "Model: ${MODEL_NAME}"
 echo "Data path: ${DATA_PATH}"
 echo "Log file: ${LOG_FILE}"
 echo "JAX cache: ${JAX_COMPILATION_CACHE_DIR}"
@@ -86,6 +96,8 @@ echo "Run name: ${RUN_NAME}"
 
 CMD=(
   python -m spikyeggroll.train
+  --dataset "${DATASET}" \
+  --model_name "${MODEL_NAME}" \
   --pop_size "${POP_SIZE}" \
   --rank "${RANK}" \
   --sigma "${SIGMA}" \
