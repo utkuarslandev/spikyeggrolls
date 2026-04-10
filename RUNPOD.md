@@ -146,10 +146,10 @@ Add an alias to `~/.ssh/config` and update only the port when the pod restarts:
 
 ```sshconfig
 Host runpod-spiky
-    HostName 210.164.16.102
-    User root
-    Port 14605
-    IdentityFile ~/.ssh/id_ed25519
+    HostName <runpod-public-ip-or-hostname>
+    User <runpod-ssh-user>
+    Port <runpod-ssh-port>
+    IdentityFile <path-to-private-key>
     StrictHostKeyChecking accept-new
 ```
 

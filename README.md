@@ -23,7 +23,7 @@ Input [B, 25, 784]  (Poisson rate-coded MNIST, T=25 timesteps)
   → spike count readout → argmax → classification
 ```
 
-Fitness: negative cross-entropy on spike counts. All weight matrices optimized via low-rank (rank-3) EGGROLL perturbations with Adam.
+ok nowFitness: negative cross-entropy on spike counts. All weight matrices optimized via low-rank (rank-3) EGGROLL perturbations with AdamW.
 
 ## Quick start
 
@@ -89,6 +89,23 @@ Long-running jobs now emit:
 Evaluation note: test accuracy is computed in fixed-size chunks using the training
 batch size; when `10000 % batch_size != 0`, the final partial chunk is dropped to
 avoid extra JIT recompiles.
+
+## Defaults and precedence
+
+Effective runtime settings are resolved in this order:
+
+1. explicit environment variable overrides (for example `POP_SIZE=4096 make tune-runpod`)
+2. preset defaults in `scripts/run_train.sh` (`smoke`, `tune`, `full`)
+3. CLI defaults in `spikyeggroll/train.py` when running `python -m spikyeggroll.train` directly
+4. `SNNConfig` defaults in `spikyeggroll/configs.py` when `train()` is called programmatically
+
+Preset defaults in `scripts/run_train.sh`:
+
+| Preset | pop_size | rank | sigma | lr | epochs | batch_size | chunk_size |
+|--------|----------|------|-------|----|--------|------------|------------|
+| smoke  | 512      | 2    | 0.02  | 0.005 | 30   | 128        | 256        |
+| tune   | 2048     | 2    | 0.01  | 0.005 | 100  | 256        | 512        |
+| full   | 10000    | 3    | 0.007 | 0.001 | 4000 | 256        | 1024       |
 
 ## Key findings
 

@@ -18,7 +18,7 @@ $$o_\ell^t = \mathbf{1}[V_\ell^t > \theta_\ell]$$
 
 $$V_\ell^t \leftarrow V_\ell^t - o_\ell^t \cdot \theta_\ell \qquad \text{(soft reset)}$$
 
-where $\beta = 0.95$ (membrane decay, frozen), $\theta_\ell \in \mathbb{R}^{n_\ell}$ (per-neuron threshold, **learnable**).
+where $\beta = 0.95$ (membrane decay, frozen) and $\theta = 1.0$ (single scalar threshold, frozen and shared across layers).
 
 Soft reset preserves the supra-threshold residual $V - \theta$ after a spike. This is smoother than hard reset ($V \leftarrow 0$) and more amenable to ES optimization.
 
@@ -45,16 +45,18 @@ CE is smooth in logit space — small weight changes shift class probabilities c
 | $W_1$ | $128 \times 784$ | 100,352 | MM\_PARAM (low-rank) |
 | $W_2$ | $128 \times 128$ | 16,384 | MM\_PARAM (low-rank) |
 | $W_3$ | $10 \times 128$ | 1,280 | MM\_PARAM (low-rank) |
-| $\theta_1$ | $128$ | 128 | PARAM (full noise) |
-| $\theta_2$ | $128$ | 128 | PARAM (full noise) |
-| $\theta_{\text{out}}$ | $10$ | 10 | PARAM (full noise) |
-| **Total** | | **118,282** | |
+| **Total** | | **118,016** | |
 
 ### EGGROLL perturbation
 
 Weight matrices perturbed as $\tilde{W} = W + \sigma A B^\top / \sqrt{r}$ where $A \in \mathbb{R}^{m \times r}$, $B \in \mathbb{R}^{n \times r}$ are i.i.d. Gaussian. For $W_1$ (128×784) with $r = 8$: each perturbation is rank-8, requiring $128 \times 8 + 784 \times 8 = 7296$ scalars instead of 100,352 — a 14× compression.
 
-Thresholds use full Gaussian perturbation (266 parameters, negligible cost).
+Only weight matrices are perturbed in this configuration; threshold is frozen at
+inference and training time.
+
+Implementation note: the current code path freezes `threshold` in
+`spikyeggroll/models/snn.py` via `merge_frozen(...)`, then reuses that same scalar
+as `thr1`, `thr2`, and `thr_out` in the forward pass.
 
 ## Experiment 1 — Hyperparameter sweeps
 
