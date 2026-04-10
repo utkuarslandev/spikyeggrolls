@@ -1,6 +1,7 @@
 """Hyperparameter configuration."""
 
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass
@@ -30,8 +31,17 @@ class SNNConfig:
     chunk_size: int = 0
     num_epochs: int = 400
     seed: int = 0
+    log_interval: int = 10
+    test_interval: int = 100
+    checkpoint_interval: int = 100
 
     # Data
     dataset: str = "mnist"
     data_path: str = "data"
     dtype: str = "float32"
+
+    # Run artifacts
+    run_name: str = "default"
+    log_dir: str = "logs/spikyeggroll"
+    checkpoint_dir: str = "checkpoints/spikyeggroll"
+    resume_from: Optional[str] = None

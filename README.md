@@ -30,7 +30,9 @@ Fitness: negative cross-entropy on spike counts. All weight matrices optimized v
 ```bash
 # Setup
 git clone https://github.com/ESHyperscale/HyperscaleES
-uv venv && uv pip install -e . && uv pip install -e HyperscaleES/
+uv venv
+uv pip install -e ".[cuda12]"
+uv pip install -e HyperscaleES/
 
 # Train (best config, ~60 min on RTX 4080)
 .venv/bin/python -m spikyeggroll.train \
@@ -43,6 +45,36 @@ uv venv && uv pip install -e . && uv pip install -e HyperscaleES/
 # Run tests
 .venv/bin/python -m pytest tests/ -v
 ```
+
+## Environment Profiles
+
+The repo now supports shared launchers for both local GPU machines and Runpod Pods:
+
+```bash
+# Local
+make bootstrap-local
+make doctor-local
+make smoke-local
+
+# Runpod
+make bootstrap-runpod
+make doctor-runpod
+make smoke-runpod
+```
+
+Both paths run the same Python training entry point through environment profiles in
+`env/local.env` and `env/runpod.env`.
+
+The default bootstrap path targets NVIDIA CUDA 12 environments. For a non-Runpod
+local setup, override `SPIKYEGGROLL_INSTALL_TARGET` if you need a different JAX
+install target.
+
+Long-running jobs now emit:
+
+- stdout logs in `LOG_DIR/<run_name>.stdout.log`
+- structured metrics in `LOG_DIR/<run_name>.metrics.jsonl`
+- a final summary in `LOG_DIR/<run_name>.summary.json`
+- checkpoints in `CHECKPOINT_DIR/<run_name>-{last,best,interrupt}.pkl`
 
 ## Key findings
 
@@ -58,5 +90,9 @@ See [docs/baseline-validation.md](docs/baseline-validation.md) for full experime
 
 - JAX (with GPU support)
 - [HyperscaleES](https://github.com/ESHyperscale/HyperscaleES) — EGGROLL evolution strategy framework (clone into repo root)
-- torchvision (for MNIST download)
+- torch + torchvision (for MNIST download)
 - optax
+
+## Runpod
+
+See [RUNPOD.md](RUNPOD.md) for a Pod setup guide, bootstrap script, and smoke/tuning commands.
