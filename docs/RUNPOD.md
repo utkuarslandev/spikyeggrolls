@@ -26,9 +26,8 @@ cd spikyeggrolls
 make bootstrap-runpod
 ```
 
-By default the bootstrap script clones `HyperscaleES` into `/workspace/HyperscaleES`,
-creates `.venv`, installs this repo with the `cuda13` extra, installs
-`HyperscaleES`, and then runs a hard-failing doctor check that requires a non-CPU
+By default the bootstrap script creates `.venv`, installs this repo with the
+`cuda13` extra, and then runs a hard-failing doctor check that requires a non-CPU
 JAX device.
 
 ## Run commands
@@ -114,12 +113,6 @@ cd /workspace/spikyeggrolls
 make doctor-runpod
 ```
 
-Override the sibling `HyperscaleES` checkout:
-
-```bash
-HYPERSCALEES_DIR=/workspace/custom/HyperscaleES make bootstrap-runpod
-```
-
 Force the older JAX CUDA 12 wheels if a Pod image or driver stack needs them:
 
 ```bash
@@ -184,9 +177,7 @@ Available remote targets:
 
 ## Notes
 
-- `HyperscaleES` is still an external dependency. The bootstrap path assumes a
-  workspace-level checkout at `/workspace/HyperscaleES` (local bootstrap defaults
-  to `../HyperscaleES`).
+- `hyperscalees` is vendored in this repository, so no sibling checkout is required.
 - `torch` and `torchvision` are required because MNIST loading is implemented via
   `torchvision.datasets.MNIST`.
 - Runpod now defaults to the JAX `cuda13` extra. Use `SPIKYEGGROLL_INSTALL_TARGET='.[cuda12]'`

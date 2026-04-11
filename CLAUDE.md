@@ -6,7 +6,7 @@ Spiking neural networks trained with EGGROLL evolution strategies in JAX.
 
 - Use `uv` for virtual environment management (`uv venv`, `uv pip install`, etc.)
 - Run Python via `.venv/bin/python`
-- HyperscaleES is a local source dependency. Bootstrap expects a sibling checkout at `../HyperscaleES` (Runpod: `/workspace/HyperscaleES`). Install with `uv pip install -e ../HyperscaleES/` or set `HYPERSCALEES_DIR` to your path. Alternatively add `HyperscaleES/src` to PYTHONPATH.
+- `hyperscalees` is vendored inside this repo and installs with the project package.
 - Local profile (`env/local.env`) defaults to CUDA JAX (`.[cuda12]`) and `REQUIRE_ACCELERATOR=1` so checks expect a GPU; use `REQUIRE_ACCELERATOR=0` for CPU-only dev.
 
 ## Quick start

@@ -8,9 +8,6 @@ export REPO_ROOT
 
 source "${REPO_ROOT}/env/runpod.env"
 
-HYPERSCALEES_DIR="${HYPERSCALEES_DIR:-${WORKSPACE_ROOT}/HyperscaleES}"
-HYPERSCALEES_REPO="${HYPERSCALEES_REPO:-https://github.com/ESHyperscale/HyperscaleES.git}"
-
 if command -v apt-get >/dev/null 2>&1; then
     apt-get update
     apt-get install -y git curl
@@ -23,10 +20,6 @@ fi
 
 mkdir -p "${WORKSPACE_ROOT}" "${DATA_PATH}" "${LOG_DIR}" "${CHECKPOINT_DIR}" "${JAX_COMPILATION_CACHE_DIR}"
 
-if [ ! -d "${HYPERSCALEES_DIR}" ]; then
-    git clone "${HYPERSCALEES_REPO}" "${HYPERSCALEES_DIR}"
-fi
-
 cd "${REPO_ROOT}"
 
 if [ ! -d ".venv" ]; then
@@ -36,7 +29,6 @@ fi
 source .venv/bin/activate
 
 uv pip install -e "${SPIKYEGGROLL_INSTALL_TARGET}"
-uv pip install -e "${HYPERSCALEES_DIR}"
 
 bash "${REPO_ROOT}/scripts/doctor.sh" runpod
 

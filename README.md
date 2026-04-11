@@ -29,12 +29,8 @@ Fitness: negative cross-entropy on spike counts. All weight matrices optimized v
 
 ```bash
 # Setup
-cd ..
-git clone https://github.com/ESHyperscale/HyperscaleES
-cd spikyeggrolls
 uv venv
 uv pip install -e ".[cuda12]"
-uv pip install -e ../HyperscaleES/
 
 # Optional: other JAX install targets (match your driver / GPU)
 # uv pip install -e ".[cuda13]"
@@ -85,9 +81,6 @@ Local bootstrap defaults to the JAX `cuda12` extra via `env/local.env`, and
 is intended to run on GPU). For CPU-only machines, set `REQUIRE_ACCELERATOR=0` or
 install with `.[cpu]`. Runpod defaults to `cuda13` via `env/runpod.env`. Override
 `SPIKYEGGROLL_INSTALL_TARGET` if you need a different JAX wheel.
-By default, local bootstrap expects `HyperscaleES` at `../HyperscaleES` while
-Runpod bootstrap expects `/workspace/HyperscaleES`; override `HYPERSCALEES_DIR`
-if your checkout is elsewhere.
 
 Long-running jobs now emit:
 
@@ -147,9 +140,16 @@ See [docs/baseline-validation.md](docs/baseline-validation.md) for full experime
 ## Dependencies
 
 - JAX (with GPU support)
-- [HyperscaleES](https://github.com/ESHyperscale/HyperscaleES) — EGGROLL evolution strategy framework (clone as sibling path `../HyperscaleES`, or set `HYPERSCALEES_DIR`)
+- Vendored `hyperscalees` package for the EGGROLL evolution strategy framework
 - torch + torchvision (for MNIST download)
 - optax
+
+## Vendored Code
+
+This repository vendors the `hyperscalees` package from
+`ESHyperscale/HyperscaleES` for the subset of modules used by the SNN training
+path. The upstream license text is included at
+`third_party/HYPERSCALEES_LICENSE.txt`.
 
 ## Runpod
 

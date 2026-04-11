@@ -33,7 +33,10 @@ cuda13 = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["spikyeggroll*"]
+include = ["spikyeggroll*", "hyperscalees*"]
+
+[tool.setuptools.package-data]
+hyperscalees = ["tok_files/*"]
 
 [build-system]
 requires = ["setuptools>=68.0"]
