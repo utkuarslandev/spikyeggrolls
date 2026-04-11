@@ -413,3 +413,97 @@ Memory dominated by N×B×H tensors, not LoRA rank. Chunked evaluation needed fo
 - CIFAR-10 / ResNet-18 experiment deferred
 - Per-layer sigma adaptation would help (threshold_out needs 3× more sigma)
 - Chunked update step needed for pop>10k (EGGROLL replays all N noise vectors at once)
+
+---
+
+## April 11 — CIFAR-10 / Spiking ResNet18 Remote Runs
+
+### Implementation state
+
+- The old residual MLP path was replaced by a real CIFAR-sized convolutional
+  spiking ResNet path.
+- CIFAR encoding now preserves image structure over time.
+- Conv kernels use the dedicated conv ES primitive instead of full-tensor
+  parameter noise.
+- Group norm was adopted for eval stability.
+
+### 4080 findings
+
+- The larger pulled-repo smoke config
+  `pop=256, rank=2, sigma=0.01, T=8, batch=64, chunk=128`
+  OOMed on a 16 GB RTX 4080 with an attempted allocation of about `30.26 GiB`.
+- A reduced smoke run with
+  `pop=32, rank=2, T=4, batch=8, chunk=8`
+  completed and produced about `10.94%` test accuracy.
+- A 5-epoch learn check on the same reduced config stayed around `9-11%`.
+
+Takeaway:
+- The current conv ResNet path fits and runs on small 4080 configs.
+- Small-population CIFAR runs do not learn meaningfully.
+
+### Early 5090 findings
+
+- `pop=64, rank=2, T=4, batch=16, chunk=16` reached `11.33%`.
+- `pop=128, rank=2, T=8, batch=16, chunk=16` ran for 100 updates and peaked at
+  only `11.48%`.
+- Screening runs with `width=32`, `T=16`, `augment=True`, and larger
+  populations (`1024`, `2048`) showed healthy ES signal but only weak early test
+  accuracy (`~11.5-12.1%` at the first test point).
+
+Takeaway:
+- More VRAM alone does not fix CIFAR learning.
+- The network is no longer dead, but the original CIFAR config was far too weak.
+
+### Current strongest run
+
+Run:
+- `cifar5090-r2-p4096-t16-c32-b32-k96-20260411`
+
+Config:
+- `pop_size=4096`
+- `rank=2`
+- `sigma=0.006`
+- `lr=0.0015`
+- `timesteps=16`
+- `batch_size=32`
+- `chunk_size=96`
+- `augment=True`
+- `resnet_channels_base=32`
+
+Metrics snapshot:
+- First epoch time: about `114 s`
+- Later average epoch time: about `35 s`
+- GPU utilization: `99%`
+- GPU memory used: about `17 / 32.6 GiB`
+- Best test accuracy so far: **21.18%** at epoch 80
+- Last recorded test accuracy: `19.00%` at epoch 100
+- Latest sigma seen: about `0.021`
+
+Takeaway:
+- This is the first CIFAR run clearly above chance.
+- The model is learning something now.
+- Performance is still poor and has become unstable as sigma drifted upward.
+
+### Main conclusions
+
+1. The problem is no longer "dead network at initialization." The new conv path
+   has nonzero ES signal and can learn above chance.
+2. The current training loop is still a poor fit for CIFAR-scale conv SNNs.
+   One logged epoch is only one minibatch ES update, so the run has seen far
+   fewer effective training passes than the epoch count suggests.
+3. Sigma drift is a real issue. The 1/5th rule helps early but needs a cap.
+4. The current loop still uses z-score fitness shaping, while the stronger MNIST
+   experiments benefited from centered-rank shaping.
+5. The model currently uses group norm for stability, but stronger CIFAR SNN
+   literature usually relies on BN/BNTT-like normalization.
+6. The 5090 run is compute-bound, not memory-bound. Extra VRAM headroom does not
+   imply unused GPU compute.
+
+### Next priorities
+
+- Add a sigma ceiling.
+- Switch to centered-rank shaping.
+- Revisit what "epoch" means for CIFAR training.
+- Explore faster update paths and lower precision.
+- Treat larger batch/chunk settings as throughput tuning, not as the main fix
+  for poor CIFAR accuracy.
