@@ -94,6 +94,13 @@ def compute_fitness(spike_counts, labels):
     return -ce
 
 
+def summarize_output_activity(outputs):
+    return {
+        "output_nonzero_fraction": float(jnp.mean(outputs != 0)),
+        "output_class_variance_mean": float(jnp.mean(jnp.var(outputs, axis=-1))),
+    }
+
+
 def train(cfg: SNNConfig = None):
     """Run EGGROLL training.
 
@@ -195,8 +202,11 @@ def train(cfg: SNNConfig = None):
         print(f"Architecture: {cfg.n_inputs}-{cfg.hidden_size}-{cfg.hidden_size}-{cfg.n_classes}")
     else:
         print(
-            f"Architecture: residual_snn width={cfg.resnet_width} blocks={cfg.resnet_blocks} "
-            f"in={cfg.n_inputs} classes={cfg.n_classes}"
+            "Architecture: spiking_resnet18 "
+            f"stages={list(cfg.resnet_block_counts)} "
+            f"channels={[cfg.resnet_channels_base * (2 ** i) for i in range(4)]} "
+            f"in_channels={cfg.in_channels} norm={cfg.resnet_norm}:{cfg.resnet_norm_groups} "
+            f"classes={cfg.n_classes}"
         )
     print(f"EGGROLL: pop={N}, rank={cfg.rank}, sigma={cfg.sigma}, lr={cfg.lr}")
     print(f"Run: {cfg.run_name} | metrics: {metrics_path} | checkpoints: {checkpoint_dir}")
@@ -308,6 +318,7 @@ def train(cfg: SNNConfig = None):
             fitnesses = EggRoll.convert_fitnesses(
                 frozen_noiser_params, noiser_params, raw_scores
             )
+            raw_score_std = float(jnp.std(raw_scores))
 
             # Update parameters
             noiser_params, params = jit_update(noiser_params, params, fitnesses, iterinfo)
@@ -321,16 +332,20 @@ def train(cfg: SNNConfig = None):
             else:
                 ema_success = 0.9 * ema_success + 0.1 * success_rate
 
-            if ema_success > 0.2:
-                noiser_params["sigma"] = noiser_params["sigma"] * 1.02
-            elif ema_success < 0.2:
-                noiser_params["sigma"] = noiser_params["sigma"] / 1.02
+            if epoch >= cfg.sigma_warmup_epochs:
+                if ema_success > 0.2:
+                    noiser_params["sigma"] = noiser_params["sigma"] * 1.02
+                elif ema_success < 0.2:
+                    noiser_params["sigma"] = noiser_params["sigma"] / 1.02
+
+            noiser_params["sigma"] = jnp.maximum(noiser_params["sigma"], cfg.sigma_min)
 
             do_log = cfg.log_interval > 0 and epoch % cfg.log_interval == 0
             do_test = cfg.test_interval > 0 and epoch % cfg.test_interval == 0
             do_checkpoint = cfg.checkpoint_interval > 0 and epoch % cfg.checkpoint_interval == 0
 
             val_acc = float(jnp.mean(jnp.argmax(val_out, axis=-1) == y_batch))
+            output_activity = summarize_output_activity(val_out)
             elapsed = time.time() - t_start
             eps = (epoch - start_epoch + 1) / elapsed if elapsed > 0 else 0.0
             test_acc = eval_test() if do_test else None
@@ -343,10 +358,12 @@ def train(cfg: SNNConfig = None):
                 "val_fitness": float(val_fitness),
                 "val_acc": val_acc,
                 "sigma": float(noiser_params["sigma"]),
+                "raw_score_std": raw_score_std,
                 "n_better": n_better,
                 "pop_size": N,
                 "success_rate": success_rate,
                 "ema_success": float(ema_success),
+                **output_activity,
                 "test_acc": test_acc,
                 "timestamp": time.time(),
             }
@@ -393,7 +410,7 @@ def train(cfg: SNNConfig = None):
                     f"fitness: {float(val_fitness):.4f} | "
                     f"acc: {val_acc:.4f} | "
                     f"σ: {float(noiser_params['sigma']):.5f} | "
-                    f"better: {n_better:4d}/{N} ema:{float(ema_success):.3f} | "
+                    f"better: {n_better:4d}/{N} std:{raw_score_std:.5f} ema:{float(ema_success):.3f} | "
                     f"{eps:.1f} ep/s"
                     f"{test_str}"
                 )
@@ -458,11 +475,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model_name", type=str, default=None, choices=["mlp_snn", "spiking_resnet18"])
     parser.add_argument("--N", type=int, default=None, help="Override n_inputs")
     parser.add_argument("--hidden_size", type=int, default=None)
-    parser.add_argument("--resnet_width", type=int, default=None)
-    parser.add_argument("--resnet_blocks", type=int, default=None)
+    parser.add_argument("--resnet_channels_base", type=int, default=None)
+    parser.add_argument("--resnet_norm", type=str, default=None, choices=["group"])
+    parser.add_argument("--resnet_norm_groups", type=int, default=None)
     parser.add_argument("--pop_size", type=int, default=None)
     parser.add_argument("--rank", type=int, default=None)
     parser.add_argument("--sigma", type=float, default=None)
+    parser.add_argument("--sigma_min", type=float, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--chunk_size", type=int, default=None, help="Chunk population eval (0=no chunking)")
@@ -486,6 +505,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log_interval", type=int, default=None)
     parser.add_argument("--test_interval", type=int, default=None)
     parser.add_argument("--checkpoint_interval", type=int, default=None)
+    parser.add_argument("--sigma_warmup_epochs", type=int, default=None)
     return parser
 
 
@@ -505,13 +525,24 @@ def build_config_from_args(args) -> SNNConfig:
         model_name=args.model_name or base_cfg.model_name,
         n_inputs=args.N if args.N is not None else dflt["n_inputs"],
         hidden_size=args.hidden_size if args.hidden_size is not None else base_cfg.hidden_size,
-        resnet_width=args.resnet_width if args.resnet_width is not None else base_cfg.resnet_width,
-        resnet_blocks=args.resnet_blocks if args.resnet_blocks is not None else base_cfg.resnet_blocks,
+        resnet_channels_base=(
+            args.resnet_channels_base
+            if args.resnet_channels_base is not None
+            else base_cfg.resnet_channels_base
+        ),
+        resnet_block_counts=base_cfg.resnet_block_counts,
+        resnet_norm=args.resnet_norm or base_cfg.resnet_norm,
+        resnet_norm_groups=(
+            args.resnet_norm_groups
+            if args.resnet_norm_groups is not None
+            else base_cfg.resnet_norm_groups
+        ),
         n_classes=base_cfg.n_classes,
         timesteps=args.timesteps if args.timesteps is not None else base_cfg.timesteps,
         pop_size=args.pop_size if args.pop_size is not None else base_cfg.pop_size,
         rank=args.rank if args.rank is not None else base_cfg.rank,
         sigma=args.sigma if args.sigma is not None else base_cfg.sigma,
+        sigma_min=args.sigma_min if args.sigma_min is not None else base_cfg.sigma_min,
         lr=args.lr if args.lr is not None else base_cfg.lr,
         batch_size=args.batch_size if args.batch_size is not None else base_cfg.batch_size,
         num_epochs=args.epochs if args.epochs is not None else base_cfg.num_epochs,
@@ -541,6 +572,11 @@ def build_config_from_args(args) -> SNNConfig:
             args.checkpoint_interval
             if args.checkpoint_interval is not None
             else base_cfg.checkpoint_interval
+        ),
+        sigma_warmup_epochs=(
+            args.sigma_warmup_epochs
+            if args.sigma_warmup_epochs is not None
+            else base_cfg.sigma_warmup_epochs
         ),
     )
 

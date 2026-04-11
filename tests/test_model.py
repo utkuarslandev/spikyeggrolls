@@ -39,24 +39,23 @@ def test_rand_init_shapes():
 
 
 def test_spiking_resnet_init_structure():
-    """SpikingResNet18 init should expose stem/output and residual block params."""
+    """SpikingResNet18 init should expose conv stem/output and residual stage params."""
     key = jax.random.key(7)
     cfg = SNNConfig(
         dataset="cifar10",
         model_name="spiking_resnet18",
         n_inputs=3072,
         n_classes=10,
-        resnet_width=128,
-        resnet_blocks=2,
     )
     frozen_params, params, _, _ = SpikingResNet18Model.rand_init(key, cfg)
-    assert "linear1" in params
+    assert "stem_conv" in params
+    assert "stem_norm" in params
     assert "linear_out" in params
-    assert "block0_a" in params
-    assert "block1_b" in params
-    assert params["linear1"]["weight"].shape == (128, 3072)
-    assert params["linear_out"]["weight"].shape == (10, 128)
-    assert frozen_params["resnet_blocks"] == 2
+    assert "stage0_block0" in params
+    assert "stage3_block1" in params
+    assert params["stem_conv"]["weight"].shape == (64, 3, 3, 3)
+    assert params["linear_out"]["weight"].shape == (10, 512)
+    assert tuple(frozen_params["stage_blocks"]) == (2, 2, 2, 2)
 
 
 @pytest.mark.parametrize(
@@ -83,11 +82,9 @@ def test_spiking_resnet_init_structure():
                 n_classes=10,
                 timesteps=4,
                 pop_size=8,
-                resnet_width=64,
-                resnet_blocks=2,
             ),
             SpikingResNet18Model,
-            (4, 4, 3072),
+            (4, 4, 3, 32, 32),
         ),
     ],
 )
@@ -149,3 +146,11 @@ def test_cli_dataset_defaults_switch_with_cifar10():
     assert cfg.in_channels == 3
     assert cfg.image_size == 32
     assert cfg.pop_size == SNNConfig().pop_size
+
+
+def test_cli_rejects_removed_legacy_resnet_flags():
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--resnet_width", "128"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--resnet_blocks", "2"])

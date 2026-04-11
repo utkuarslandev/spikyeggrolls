@@ -15,13 +15,14 @@ def load_cifar10(path: str = "data/cifar10", augment: bool = False):
 
     Args:
         path: directory to store/load the dataset
-        augment: currently unused placeholder for parity with config
+        augment: currently unsupported placeholder
 
     Returns:
         (train_images [N,32,32,3] float32 in [0,1], train_labels [N] int32,
          test_images, test_labels)
     """
-    del augment
+    if augment:
+        raise NotImplementedError("CIFAR-10 augmentation is not implemented.")
     from torchvision import datasets
 
     train_dataset = datasets.CIFAR10(root=path, train=True, download=True)
@@ -44,12 +45,11 @@ def _poisson_encode_images(images, timesteps, key):
         key: JAX PRNG key
 
     Returns:
-        [N, T, H*W*C] float32 binary spike tensor
+        [N, T, C, H, W] float32 binary spike tensor
     """
     n, h, w, c = images.shape
-    flat = jnp.reshape(images, (n, h * w * c))
-    probs = flat[:, None, :]
-    uniform = jax.random.uniform(key, (n, timesteps, flat.shape[1]))
+    probs = jnp.transpose(images, (0, 3, 1, 2))[:, None, :, :, :]
+    uniform = jax.random.uniform(key, (n, timesteps, c, h, w))
     spikes = (uniform < probs).astype(jnp.float32)
     return spikes
 
@@ -63,6 +63,6 @@ def encode_batch(images, timesteps, key):
         key: JAX PRNG key
 
     Returns:
-        [B, T, 3072] float32 binary spike tensor
+        [B, T, 3, 32, 32] float32 binary spike tensor
     """
     return _poisson_encode_images(images, timesteps, key)

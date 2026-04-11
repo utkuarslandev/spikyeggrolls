@@ -1,219 +1,457 @@
-"""Deep residual spiking network for CIFAR-10 scaling experiments.
+"""CIFAR-sized spiking ResNet-18 compatible with the EGGROLL parameter pipeline."""
 
-This model uses residual blocks built from EGGROLL-compatible Linear modules so
-it can share the same ES/noiser pipeline as the MNIST model.
-"""
+from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
 
-from hyperscalees.models.base_model import Model, CommonParams
-from hyperscalees.models.common import (
-    Linear,
-    merge_inits,
-    merge_frozen,
-    call_submodule,
-)
+from hyperscalees.models.base_model import CommonInit, CommonParams, Model
+from hyperscalees.models.common import ConvKernel, Linear, Parameter, call_submodule, merge_frozen, merge_inits
 
 from spikyeggroll.configs import SNNConfig
 from spikyeggroll.models.snn import lif_step
 
 
-class SpikingResNet18Model(Model):
-    """Residual deep spiking MLP with 8 residual blocks.
+def _conv_out_dim(size: int, kernel_size: int, stride: int, padding: int) -> int:
+    return (size + 2 * padding - kernel_size) // stride + 1
 
-    Input is expected as flattened CIFAR spikes [B, T, 3072].
-    """
+
+def _conv2d_nchw(x, weight, stride: int, padding: int):
+    return jax.lax.conv_general_dilated(
+        x,
+        weight,
+        window_strides=(stride, stride),
+        padding=((padding, padding), (padding, padding)),
+        dimension_numbers=("NCHW", "OIHW", "NCHW"),
+    )
+
+
+class Conv2d(Model):
+    @classmethod
+    def rand_init(
+        cls,
+        key,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int,
+        padding: int,
+        use_bias: bool,
+        dtype,
+    ):
+        k1, k2 = jax.random.split(key)
+        init = merge_inits(
+            weight=ConvKernel.rand_init(
+                k1, in_channels, out_channels, kernel_size, dtype
+            )
+        )
+        if use_bias:
+            bias_init = Parameter.rand_init(
+                k2, None, None, jnp.zeros((out_channels,), dtype=dtype), dtype
+            )
+            init = CommonInit(
+                init.frozen_params,
+                {**init.params, "bias": bias_init.params},
+                {**init.scan_map, "bias": bias_init.scan_map},
+                {**init.es_map, "bias": bias_init.es_map},
+            )
+        return merge_frozen(init, stride=stride, padding=padding)
+
+    @classmethod
+    def _forward(cls, common_params: CommonParams, x):
+        stride = int(common_params.frozen_params["stride"])
+        padding = int(common_params.frozen_params["padding"])
+        weight = call_submodule(ConvKernel, "weight", common_params)
+        out = _conv2d_nchw(x, weight, stride=stride, padding=padding)
+        if "bias" in common_params.params:
+            bias = call_submodule(Parameter, "bias", common_params)
+            out = out + bias[None, :, None, None]
+        return out
+
+
+class GroupNorm2d(Model):
+    @classmethod
+    def rand_init(
+        cls, key, channels: int, dtype, num_groups: int = 8, eps: float = 1e-5
+    ):
+        if channels % num_groups != 0:
+            raise ValueError(
+                f"channels={channels} must be divisible by num_groups={num_groups}"
+            )
+        k1, k2 = jax.random.split(key)
+        init = merge_inits(
+            weight=Parameter.rand_init(
+                k1, None, None, jnp.ones((channels,), dtype=dtype), dtype
+            ),
+            bias=Parameter.rand_init(
+                k2, None, None, jnp.zeros((channels,), dtype=dtype), dtype
+            ),
+        )
+        return merge_frozen(init, eps=eps, num_groups=num_groups)
+
+    @classmethod
+    def _forward(cls, common_params: CommonParams, x):
+        eps = common_params.frozen_params["eps"]
+        num_groups = int(common_params.frozen_params["num_groups"])
+        batch, channels, height, width = x.shape
+        grouped = x.reshape(batch, num_groups, channels // num_groups, height, width)
+        mean = jnp.mean(grouped, axis=(2, 3, 4), keepdims=True)
+        var = jnp.var(grouped, axis=(2, 3, 4), keepdims=True)
+        normed = (grouped - mean) / jnp.sqrt(var + eps)
+        normed = normed.reshape(batch, channels, height, width)
+        weight = call_submodule(Parameter, "weight", common_params)[None, :, None, None]
+        bias = call_submodule(Parameter, "bias", common_params)[None, :, None, None]
+        return normed * weight + bias
+
+
+class ProjectionShortcut(Model):
+    @classmethod
+    def rand_init(
+        cls,
+        key,
+        in_channels: int,
+        out_channels: int,
+        stride: int,
+        dtype,
+        norm_groups: int,
+    ):
+        k1, k2 = jax.random.split(key)
+        return merge_inits(
+            conv=Conv2d.rand_init(
+                k1,
+                in_channels,
+                out_channels,
+                kernel_size=1,
+                stride=stride,
+                padding=0,
+                use_bias=False,
+                dtype=dtype,
+            ),
+            norm=GroupNorm2d.rand_init(k2, out_channels, dtype, norm_groups),
+        )
+
+    @classmethod
+    def _forward(cls, common_params: CommonParams, x):
+        x = call_submodule(Conv2d, "conv", common_params, x)
+        x = call_submodule(GroupNorm2d, "norm", common_params, x)
+        return x
+
+
+class BasicBlock(Model):
+    @classmethod
+    def rand_init(
+        cls,
+        key,
+        in_channels: int,
+        out_channels: int,
+        stride: int,
+        cfg: SNNConfig,
+    ):
+        k1, k2, k3, k4, k5 = jax.random.split(key, 5)
+        init = merge_inits(
+            conv1=Conv2d.rand_init(
+                k1,
+                in_channels,
+                out_channels,
+                kernel_size=3,
+                stride=stride,
+                padding=1,
+                use_bias=False,
+                dtype=cfg.dtype,
+            ),
+            norm1=GroupNorm2d.rand_init(
+                k2, out_channels, cfg.dtype, cfg.resnet_norm_groups
+            ),
+            conv2=Conv2d.rand_init(
+                k3,
+                out_channels,
+                out_channels,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                use_bias=False,
+                dtype=cfg.dtype,
+            ),
+            norm2=GroupNorm2d.rand_init(
+                k4, out_channels, cfg.dtype, cfg.resnet_norm_groups
+            ),
+        )
+
+        if stride != 1 or in_channels != out_channels:
+            shortcut_init = ProjectionShortcut.rand_init(
+                k5,
+                in_channels,
+                out_channels,
+                stride,
+                cfg.dtype,
+                cfg.resnet_norm_groups,
+            )
+            init = CommonInit(
+                {
+                    **(init.frozen_params or {}),
+                    "shortcut": shortcut_init.frozen_params,
+                },
+                {**init.params, "shortcut": shortcut_init.params},
+                {**init.scan_map, "shortcut": shortcut_init.scan_map},
+                {**init.es_map, "shortcut": shortcut_init.es_map},
+            )
+
+        init = merge_frozen(init, beta=cfg.beta, threshold=cfg.threshold)
+        init.params["norm2"]["weight"] = jnp.zeros_like(init.params["norm2"]["weight"])
+        return init
+
+    @classmethod
+    def _forward(cls, common_params: CommonParams, x, state, collect_stats: bool = False):
+        beta = common_params.frozen_params["beta"]
+        threshold = common_params.frozen_params["threshold"]
+        v1, v2 = state
+        shortcut = x
+
+        out = call_submodule(Conv2d, "conv1", common_params, x)
+        out = call_submodule(GroupNorm2d, "norm1", common_params, out)
+        v1, s1 = lif_step(v1, out, beta, threshold)
+
+        out = call_submodule(Conv2d, "conv2", common_params, s1)
+        out = call_submodule(GroupNorm2d, "norm2", common_params, out)
+        v2, s2 = lif_step(v2, out, beta, threshold)
+
+        if "shortcut" in common_params.params:
+            shortcut = call_submodule(ProjectionShortcut, "shortcut", common_params, x)
+
+        out = shortcut + s2
+        if collect_stats:
+            stats = {
+                "conv1_rate": jnp.mean(s1),
+                "conv2_rate": jnp.mean(s2),
+                "block_output_nonzero_fraction": jnp.mean(out != 0),
+            }
+            return out, (v1, v2), stats
+
+        return out, (v1, v2)
+
+
+class SpikingResNet18Model(Model):
+    """Convolutional CIFAR-sized spiking ResNet-18."""
+
+    STAGE_BLOCKS = (2, 2, 2, 2)
 
     @classmethod
     def rand_init(cls, key, cfg: SNNConfig):
-        blocks = int(cfg.resnet_blocks)
-        width = int(cfg.resnet_width)
-        total_keys = 2 + blocks * 2
-        keys = jax.random.split(key, total_keys)
+        if cfg.dataset == "cifar10" and (
+            cfg.in_channels != 3 or cfg.image_size != 32 or cfg.n_inputs != 3072
+        ):
+            raise ValueError(
+                "spiking_resnet18 expects CIFAR-10 config defaults: "
+                "in_channels=3, image_size=32, n_inputs=3072."
+            )
+        if cfg.resnet_norm != "group":
+            raise ValueError("Only resnet_norm='group' is supported for spiking_resnet18.")
+        if tuple(cfg.resnet_block_counts) != cls.STAGE_BLOCKS:
+            raise ValueError(
+                "spiking_resnet18 requires resnet_block_counts=(2, 2, 2, 2)."
+            )
+
         dtype = cfg.dtype
+        base_channels = int(cfg.resnet_channels_base)
+        stage_channels = tuple(base_channels * (2**i) for i in range(4))
+        stage_blocks = tuple(cfg.resnet_block_counts)
+
+        n_block_keys = sum(stage_blocks)
+        keys = jax.random.split(key, 3 + n_block_keys)
 
         all_inits = {
-            "linear1": Linear.rand_init(keys[0], cfg.n_inputs, width, False, dtype),
-            "linear_out": Linear.rand_init(keys[1], width, cfg.n_classes, False, dtype),
+            "stem_conv": Conv2d.rand_init(
+                keys[0],
+                cfg.in_channels,
+                base_channels,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                use_bias=False,
+                dtype=dtype,
+            ),
+            "stem_norm": GroupNorm2d.rand_init(
+                keys[1], base_channels, dtype, cfg.resnet_norm_groups
+            ),
+            "linear_out": Linear.rand_init(
+                keys[2], stage_channels[-1], cfg.n_classes, True, dtype
+            ),
         }
-        for i in range(blocks):
-            all_inits[f"block{i}_a"] = Linear.rand_init(
-                keys[2 + i * 2], width, width, False, dtype
-            )
-            all_inits[f"block{i}_b"] = Linear.rand_init(
-                keys[2 + i * 2 + 1], width, width, False, dtype
-            )
+
+        key_idx = 3
+        in_channels = base_channels
+        for stage_idx, (out_channels, block_count) in enumerate(zip(stage_channels, stage_blocks)):
+            for block_idx in range(block_count):
+                stride = 2 if stage_idx > 0 and block_idx == 0 else 1
+                name = f"stage{stage_idx}_block{block_idx}"
+                all_inits[name] = BasicBlock.rand_init(
+                    keys[key_idx], in_channels, out_channels, stride, cfg
+                )
+                in_channels = out_channels
+                key_idx += 1
 
         init = merge_inits(**all_inits)
-
         init = merge_frozen(
             init,
             beta=cfg.beta,
             threshold=cfg.threshold,
             timesteps=cfg.timesteps,
             membrane_readout=cfg.membrane_readout,
-            resnet_blocks=blocks,
-            resnet_width=width,
+            stage_channels=stage_channels,
+            stage_blocks=stage_blocks,
+            resnet_channels_base=base_channels,
+            resnet_norm=cfg.resnet_norm,
+            resnet_norm_groups=cfg.resnet_norm_groups,
         )
         return init
 
     @classmethod
-    def _forward(cls, common_params: CommonParams, x, l1_base=None):
-        bsz = x.shape[0]
-        timesteps = common_params.frozen_params["timesteps"]
+    def _initial_block_states(cls, batch_size: int, image_size: int, stage_channels, stage_blocks):
+        states = []
+        spatial = image_size
+        for stage_idx, (out_channels, block_count) in enumerate(zip(stage_channels, stage_blocks)):
+            for block_idx in range(block_count):
+                stride = 2 if stage_idx > 0 and block_idx == 0 else 1
+                spatial = _conv_out_dim(spatial, 3, stride, 1)
+                shape = (batch_size, out_channels, spatial, spatial)
+                states.append((jnp.zeros(shape), jnp.zeros(shape)))
+        return tuple(states)
+
+    @classmethod
+    def _scan_step(cls, common_params: CommonParams, carry, x_t):
         beta = common_params.frozen_params["beta"]
         threshold = common_params.frozen_params["threshold"]
         use_membrane = common_params.frozen_params["membrane_readout"]
-        n_blocks = int(common_params.frozen_params["resnet_blocks"])
-        width = int(common_params.frozen_params["resnet_width"])
-        n_classes = common_params.params["linear_out"]["weight"].shape[0]
+        stage_blocks = common_params.frozen_params["stage_blocks"]
 
-        has_l1_base = l1_base is not None
-        if has_l1_base and common_params.iterinfo is not None:
-            from hyperscalees.noiser.eggroll import get_lora_update_params
+        stem_v, block_states, classifier_v, acc = carry
 
-            l1_key = common_params.es_tree_key["linear1"]["weight"]
-            l1_param = common_params.params["linear1"]["weight"]
-            l1_sigma = common_params.noiser_params["sigma"] / jnp.sqrt(
-                common_params.frozen_noiser_params["rank"]
-            )
-            l1_A, l1_B = get_lora_update_params(
-                common_params.frozen_noiser_params,
-                l1_sigma,
-                common_params.iterinfo,
-                l1_param,
-                l1_key,
-            )
+        x = call_submodule(Conv2d, "stem_conv", common_params, x_t)
+        x = call_submodule(GroupNorm2d, "stem_norm", common_params, x)
+        stem_v, x = lif_step(stem_v, x, beta, threshold)
 
-        v_stem = jnp.zeros((bsz, width))
-        v_out = jnp.zeros((bsz, n_classes))
-        v_block_a = jnp.zeros((n_blocks, bsz, width))
-        v_block_b = jnp.zeros((n_blocks, bsz, width))
-        v_block_res = jnp.zeros((n_blocks, bsz, width))
-        accum = jnp.zeros((bsz, n_classes))
+        state_idx = 0
+        for stage_idx, block_count in enumerate(stage_blocks):
+            for block_idx in range(block_count):
+                block_name = f"stage{stage_idx}_block{block_idx}"
+                x, new_state = call_submodule(
+                    BasicBlock,
+                    block_name,
+                    common_params,
+                    x,
+                    block_states[state_idx],
+                )
+                block_states = block_states[:state_idx] + (new_state,) + block_states[state_idx + 1 :]
+                state_idx += 1
 
-        def _scan_blocks(v_a, v_b, v_r, s):
-            for i in range(n_blocks):
-                i1 = call_submodule(Linear, f"block{i}_a", common_params, s)
-                v1, s1 = lif_step(v_a[i], i1, beta, threshold)
-                v_a = v_a.at[i].set(v1)
+        pooled = jnp.mean(x, axis=(2, 3))
+        logits = call_submodule(Linear, "linear_out", common_params, pooled)
+        classifier_v = beta * classifier_v + logits
+        acc = acc + (classifier_v if use_membrane else logits)
+        return (stem_v, block_states, classifier_v, acc), None
 
-                i2 = call_submodule(Linear, f"block{i}_b", common_params, s1)
-                v2, s2 = lif_step(v_b[i], i2, beta, threshold)
-                v_b = v_b.at[i].set(v2)
-
-                v3, s = lif_step(v_r[i], s + s2, beta, threshold)
-                v_r = v_r.at[i].set(v3)
-            return v_a, v_b, v_r, s
-
-        if has_l1_base and common_params.iterinfo is not None:
-
-            def scan_fn(carry, inp):
-                stem_v, v_a, v_b, v_r, out_v, acc = carry
-                x_t, base_t = inp
-
-                i_stem = base_t + x_t @ l1_B @ l1_A.T
-                stem_v, s = lif_step(stem_v, i_stem, beta, threshold)
-                v_a, v_b, v_r, s = _scan_blocks(v_a, v_b, v_r, s)
-
-                i_out = call_submodule(Linear, "linear_out", common_params, s)
-                out_v, s_out = lif_step(out_v, i_out, beta, threshold)
-                acc = acc + (out_v if use_membrane else s_out)
-                return (stem_v, v_a, v_b, v_r, out_v, acc), None
-
-            x_t = jnp.transpose(x, (1, 0, 2))
-            (_, _, _, _, _, accum), _ = jax.lax.scan(
-                scan_fn, (v_stem, v_block_a, v_block_b, v_block_res, v_out, accum), (x_t, l1_base)
-            )
-        else:
-
-            def scan_fn(carry, x_t):
-                stem_v, v_a, v_b, v_r, out_v, acc = carry
-
-                i_stem = call_submodule(Linear, "linear1", common_params, x_t)
-                stem_v, s = lif_step(stem_v, i_stem, beta, threshold)
-                v_a, v_b, v_r, s = _scan_blocks(v_a, v_b, v_r, s)
-
-                i_out = call_submodule(Linear, "linear_out", common_params, s)
-                out_v, s_out = lif_step(out_v, i_out, beta, threshold)
-                acc = acc + (out_v if use_membrane else s_out)
-                return (stem_v, v_a, v_b, v_r, out_v, acc), None
-
-            x_t = jnp.transpose(x, (1, 0, 2))
-            (_, _, _, _, _, accum), _ = jax.lax.scan(
-                scan_fn, (v_stem, v_block_a, v_block_b, v_block_res, v_out, accum), x_t
+    @classmethod
+    def _forward(cls, common_params: CommonParams, x, l1_base=None):
+        del l1_base
+        if x.ndim != 5:
+            raise ValueError(
+                f"spiking_resnet18 expects input shape [B, T, C, H, W], got {x.shape}."
             )
 
-        return accum
+        batch_size, timesteps, _, image_size, _ = x.shape
+        stage_channels = common_params.frozen_params["stage_channels"]
+        stage_blocks = common_params.frozen_params["stage_blocks"]
+        stem_v = jnp.zeros((batch_size, stage_channels[0], image_size, image_size))
+        block_states = cls._initial_block_states(
+            batch_size, image_size, stage_channels, stage_blocks
+        )
+        classifier_v = jnp.zeros(
+            (batch_size, common_params.params["linear_out"]["weight"].shape[0])
+        )
+        acc = jnp.zeros_like(classifier_v)
+        x_t = jnp.transpose(x, (1, 0, 2, 3, 4))
+        (_, _, _, acc), _ = jax.lax.scan(
+            lambda carry, step_x: cls._scan_step(common_params, carry, step_x),
+            (stem_v, block_states, classifier_v, acc),
+            x_t,
+        )
+        return acc / timesteps
 
     @classmethod
     def forward_debug(cls, common_params: CommonParams, x):
-        """Debug forward pass that reports spike-rate statistics.
+        if x.ndim != 5:
+            raise ValueError(
+                f"spiking_resnet18 expects input shape [B, T, C, H, W], got {x.shape}."
+            )
 
-        This intentionally mirrors the eval-mode forward path and does not
-        support perturbed layer-1 base precomputation.
-        """
-        bsz = x.shape[0]
         beta = common_params.frozen_params["beta"]
         threshold = common_params.frozen_params["threshold"]
         use_membrane = common_params.frozen_params["membrane_readout"]
-        n_blocks = int(common_params.frozen_params["resnet_blocks"])
-        width = int(common_params.frozen_params["resnet_width"])
-        n_classes = common_params.params["linear_out"]["weight"].shape[0]
+        stage_channels = common_params.frozen_params["stage_channels"]
+        stage_blocks = common_params.frozen_params["stage_blocks"]
 
-        v_stem = jnp.zeros((bsz, width))
-        v_out = jnp.zeros((bsz, n_classes))
-        v_block_a = jnp.zeros((n_blocks, bsz, width))
-        v_block_b = jnp.zeros((n_blocks, bsz, width))
-        v_block_res = jnp.zeros((n_blocks, bsz, width))
-        accum = jnp.zeros((bsz, n_classes))
+        batch_size, timesteps, _, image_size, _ = x.shape
+        stem_v = jnp.zeros((batch_size, stage_channels[0], image_size, image_size))
+        block_states = list(
+            cls._initial_block_states(batch_size, image_size, stage_channels, stage_blocks)
+        )
+        classifier_v = jnp.zeros(
+            (batch_size, common_params.params["linear_out"]["weight"].shape[0])
+        )
+        acc = jnp.zeros_like(classifier_v)
 
         stem_rates = []
-        out_rates = []
-        block_a_rates = [[] for _ in range(n_blocks)]
-        block_b_rates = [[] for _ in range(n_blocks)]
-        block_res_rates = [[] for _ in range(n_blocks)]
+        stage_rates = [[] for _ in range(4)]
+        block_conv1_rates = []
+        block_conv2_rates = []
+        classifier_positive_fraction = []
+        classifier_mean = []
 
-        x_t = jnp.transpose(x, (1, 0, 2))
+        x_t = jnp.transpose(x, (1, 0, 2, 3, 4))
         for x_step in x_t:
-            i_stem = call_submodule(Linear, "linear1", common_params, x_step)
-            v_stem, s = lif_step(v_stem, i_stem, beta, threshold)
-            stem_rates.append(jnp.mean(s))
+            x_step = call_submodule(Conv2d, "stem_conv", common_params, x_step)
+            x_step = call_submodule(GroupNorm2d, "stem_norm", common_params, x_step)
+            stem_v, x_step = lif_step(stem_v, x_step, beta, threshold)
+            stem_rates.append(jnp.mean(x_step))
 
-            for i in range(n_blocks):
-                i1 = call_submodule(Linear, f"block{i}_a", common_params, s)
-                v1, s1 = lif_step(v_block_a[i], i1, beta, threshold)
-                v_block_a = v_block_a.at[i].set(v1)
-                block_a_rates[i].append(jnp.mean(s1))
+            state_idx = 0
+            for stage_idx, block_count in enumerate(stage_blocks):
+                for block_idx in range(block_count):
+                    block_name = f"stage{stage_idx}_block{block_idx}"
+                    x_step, new_state, stats = call_submodule(
+                        BasicBlock,
+                        block_name,
+                        common_params,
+                        x_step,
+                        block_states[state_idx],
+                        True,
+                    )
+                    block_states[state_idx] = new_state
+                    block_conv1_rates.append(float(stats["conv1_rate"]))
+                    block_conv2_rates.append(float(stats["conv2_rate"]))
+                    state_idx += 1
+                stage_rates[stage_idx].append(jnp.mean(x_step != 0))
 
-                i2 = call_submodule(Linear, f"block{i}_b", common_params, s1)
-                v2, s2 = lif_step(v_block_b[i], i2, beta, threshold)
-                v_block_b = v_block_b.at[i].set(v2)
-                block_b_rates[i].append(jnp.mean(s2))
+            pooled = jnp.mean(x_step, axis=(2, 3))
+            logits = call_submodule(Linear, "linear_out", common_params, pooled)
+            classifier_v = beta * classifier_v + logits
+            readout = classifier_v if use_membrane else logits
+            acc = acc + readout
+            classifier_positive_fraction.append(jnp.mean(readout > 0))
+            classifier_mean.append(jnp.mean(readout))
 
-                v3, s = lif_step(v_block_res[i], s + s2, beta, threshold)
-                v_block_res = v_block_res.at[i].set(v3)
-                block_res_rates[i].append(jnp.mean(s))
-
-            i_out = call_submodule(Linear, "linear_out", common_params, s)
-            v_out, s_out = lif_step(v_out, i_out, beta, threshold)
-            out_rates.append(jnp.mean(s_out))
-            accum = accum + (v_out if use_membrane else s_out)
-
-        def _as_float_list(values):
-            return [float(v) for v in values]
-
+        acc = acc / timesteps
         stats = {
-            "stem_spike_rates": _as_float_list(stem_rates),
-            "out_spike_rates": _as_float_list(out_rates),
-            "block_a_spike_rates": [_as_float_list(v) for v in block_a_rates],
-            "block_b_spike_rates": [_as_float_list(v) for v in block_b_rates],
-            "block_res_spike_rates": [_as_float_list(v) for v in block_res_rates],
-            "output_nonzero_fraction": float(jnp.mean(accum != 0)),
-            "output_mean": float(jnp.mean(accum)),
-            "output_max": float(jnp.max(accum)),
-            "output_class_variance_mean": float(jnp.mean(jnp.var(accum, axis=-1))),
-            "sample_output_row_sums": [float(v) for v in jnp.sum(accum, axis=-1)[:8]],
+            "stem_spike_rates": [float(v) for v in stem_rates],
+            "stage_nonzero_rates": [[float(v) for v in values] for values in stage_rates],
+            "block_conv1_spike_rates": block_conv1_rates,
+            "block_conv2_spike_rates": block_conv2_rates,
+            "classifier_positive_fraction": [float(v) for v in classifier_positive_fraction],
+            "classifier_mean": [float(v) for v in classifier_mean],
+            "output_nonzero_fraction": float(jnp.mean(acc != 0)),
+            "output_mean": float(jnp.mean(acc)),
+            "output_max": float(jnp.max(acc)),
+            "output_class_variance_mean": float(jnp.mean(jnp.var(acc, axis=-1))),
+            "sample_output_row_sums": [float(v) for v in jnp.sum(acc, axis=-1)[:8]],
         }
-        return accum, stats
+        return acc, stats

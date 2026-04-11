@@ -80,7 +80,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 LOG_FILE="${LOG_DIR}/${RUN_NAME}.stdout.log"
 
 if [ "${DATASET}" = "cifar10" ] && [ "${MODEL_NAME}" = "spiking_resnet18" ]; then
-    : "${TIMESTEPS:=4}"
+    : "${TIMESTEPS:=8}"
     : "${BATCH_SIZE:=64}"
     : "${CHUNK_SIZE:=128}"
 fi

@@ -29,6 +29,10 @@ class Noiser:
         return param
 
     @classmethod
+    def get_noisy_conv2d(cls, frozen_noiser_params, noiser_params, param, base_key, iterinfo):
+        return param
+
+    @classmethod
     def convert_fitnesses(cls, frozen_noiser_params, noiser_params, raw_scores, num_episodes_list=None):
         return raw_scores
 

@@ -48,7 +48,7 @@ uv pip install -e ".[cuda13]"
 .venv/bin/python -m spikyeggroll.train \
   --dataset cifar10 --model_name spiking_resnet18 \
   --pop_size 256 --rank 2 --sigma 0.01 --lr 0.002 --epochs 3 \
-  --timesteps 4 --batch_size 64 --chunk_size 128
+  --timesteps 8 --batch_size 64 --chunk_size 128
 
 # Run tests
 .venv/bin/python -m pytest tests/ -v
@@ -117,7 +117,13 @@ Preset defaults in `scripts/run_train.sh`:
 
 For CIFAR-10 deep runs, set `DATASET=cifar10 MODEL_NAME=spiking_resnet18`.
 The launcher also applies CIFAR-friendly defaults when those are selected:
-`TIMESTEPS=4`, `BATCH_SIZE=64`, `CHUNK_SIZE=128` (unless explicitly overridden).
+`TIMESTEPS=8`, `BATCH_SIZE=64`, and `CHUNK_SIZE=128`.
+
+This smaller CIFAR configuration is intentional. The previous `width=768`,
+`blocks=8`, `timesteps=4` default was observed to die at initialization on real
+CIFAR batches, producing zero output activity and zero ES fitness spread. See
+[docs/cifar-experiments-log.md](docs/cifar-experiments-log.md) for the probe
+results and rationale.
 
 Population-scaling sweep example (6 settings, 3 seeds each):
 

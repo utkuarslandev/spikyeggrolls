@@ -35,6 +35,9 @@ def get_nonlora_update_params(frozen_noiser_params, base_sigma, iterinfo, param,
     updates = jax.random.normal(jax.random.fold_in(jax.random.fold_in(key, true_epoch), true_thread_idx), param.shape, dtype=param.dtype)
     return updates * sigma
 
+def _flatten_conv_kernel(param):
+    return param.reshape(param.shape[0], -1)
+
 def _simple_full_update(base_sigma, param, key, scores, iterinfo, frozen_noiser_params):
     if frozen_noiser_params["freeze_nonlora"]:
         return jnp.zeros_like(param)
@@ -54,6 +57,13 @@ def _simple_lora_update(base_sigma, param, key, scores, iterinfo, frozen_noiser_
     print("LORA UPDATE", A.shape, B.shape)
     # return A.T @ B / num_envs
     return jnp.einsum('nir,njr->ij', A, B) / num_envs
+
+def _simple_conv2d_lora_update(base_sigma, param, key, scores, iterinfo, frozen_noiser_params):
+    flat_param = _flatten_conv_kernel(param)
+    flat_update = _simple_lora_update(
+        base_sigma, flat_param, key, scores, iterinfo, frozen_noiser_params
+    )
+    return flat_update.reshape(param.shape)
 
 def _noop_update(base_sigma, param, key, scores, iterinfo, frozen_noiser_params):
     return jnp.zeros_like(param)
@@ -101,6 +111,20 @@ class EggRoll(Noiser):
         return param + get_nonlora_update_params(frozen_noiser_params, noiser_params["sigma"], iterinfo, param, base_key)
 
     @classmethod
+    def get_noisy_conv2d(cls, frozen_noiser_params, noiser_params, param, base_key, iterinfo):
+        if iterinfo is None:
+            return param
+        flat_param = _flatten_conv_kernel(param)
+        A, B = get_lora_update_params(
+            frozen_noiser_params,
+            noiser_params["sigma"] / jnp.sqrt(frozen_noiser_params["rank"]),
+            iterinfo,
+            flat_param,
+            base_key,
+        )
+        return (flat_param + A @ B.T).reshape(param.shape)
+
+    @classmethod
     def convert_fitnesses(cls, frozen_noiser_params, noiser_params, raw_scores, num_episodes_list=None):
         group_size = frozen_noiser_params["group_size"]
         if group_size == 0:
@@ -115,7 +139,14 @@ class EggRoll(Noiser):
 
     @classmethod
     def _do_update(cls, param, base_key, fitnesses, iterinfos, map_classification, sigma, frozen_noiser_params, **kwargs):
-        update_fn = [_simple_full_update, _simple_lora_update, _noop_update, _noop_update][map_classification]
+        update_fns = {
+            0: _simple_full_update,
+            1: _simple_lora_update,
+            2: _noop_update,
+            3: _noop_update,
+            4: _simple_conv2d_lora_update,
+        }
+        update_fn = update_fns[map_classification]
 
         if len(base_key.shape) == 0:
             new_grad = update_fn(sigma, param, base_key, fitnesses, iterinfos, frozen_noiser_params)

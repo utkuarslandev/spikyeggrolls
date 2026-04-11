@@ -44,3 +44,17 @@ def test_get_dataset_spec_rejects_unknown_dataset():
 
     with pytest.raises(ValueError, match="Unsupported dataset"):
         get_dataset_spec(cfg)
+
+
+def test_cifar_model_defaults_reflect_debug_baseline_architecture():
+    cfg = SNNConfig(dataset="cifar10", model_name="spiking_resnet18")
+
+    assert cfg.in_channels == 3
+    assert cfg.image_size == 32
+    assert cfg.n_inputs == 3072
+    assert cfg.resnet_channels_base == 64
+    assert cfg.resnet_block_counts == (2, 2, 2, 2)
+    assert cfg.resnet_norm == "group"
+    assert cfg.resnet_norm_groups == 8
+    assert cfg.sigma_min == 0.001
+    assert cfg.sigma_warmup_epochs == 20

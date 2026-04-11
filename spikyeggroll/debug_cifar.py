@@ -29,8 +29,6 @@ def _make_cfg(args) -> SNNConfig:
         lr=args.lr,
         batch_size=args.batch_size,
         data_path=args.data_path,
-        resnet_width=args.resnet_width,
-        resnet_blocks=args.resnet_blocks,
         membrane_readout=args.membrane_readout,
     )
 
@@ -55,8 +53,6 @@ def main():
     parser = argparse.ArgumentParser(description="Probe CIFAR spiking ResNet activity at init.")
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--timesteps", type=int, default=4)
-    parser.add_argument("--resnet_width", type=int, default=768)
-    parser.add_argument("--resnet_blocks", type=int, default=8)
     parser.add_argument("--pop_size", type=int, default=512)
     parser.add_argument("--rank", type=int, default=2)
     parser.add_argument("--sigma", type=float, default=0.01)
@@ -114,8 +110,8 @@ def main():
     result = {
         "cfg": {
             "timesteps": cfg.timesteps,
-            "resnet_width": cfg.resnet_width,
-            "resnet_blocks": cfg.resnet_blocks,
+            "resnet_channels_base": cfg.resnet_channels_base,
+            "resnet_block_counts": list(cfg.resnet_block_counts),
             "pop_size": cfg.pop_size,
             "rank": cfg.rank,
             "sigma": cfg.sigma,

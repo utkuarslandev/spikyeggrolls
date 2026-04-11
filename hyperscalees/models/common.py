@@ -7,6 +7,7 @@ PARAM = 0
 MM_PARAM = 1
 EMB_PARAM = 2
 EXCLUDED=3
+CONV2D_PARAM = 4
 
 def layer_norm(x, eps=1e-5):
     mean = jnp.mean(x, axis=-1, keepdims=True)
@@ -121,6 +122,35 @@ class Embedding(Model):
     @classmethod
     def _forward(cls, common_params, x, *args, **kwargs):
         return common_params.noiser.do_emb(common_params.frozen_noiser_params, common_params.noiser_params, common_params.params, common_params.es_tree_key, common_params.iterinfo, x)
+
+class ConvKernel(Model):
+    @classmethod
+    def rand_init(cls, key, in_channels, out_channels, kernel_size, dtype, *args, **kwargs):
+        dtype = jnp.dtype(dtype)
+        fan_in = in_channels * kernel_size * kernel_size
+        scale = 1 / jnp.sqrt(fan_in)
+        params = (
+            jax.random.normal(
+                key,
+                (out_channels, in_channels, kernel_size, kernel_size),
+                dtype=dtype,
+            )
+            * scale
+        )
+        frozen_params = None
+        scan_map = ()
+        es_map = CONV2D_PARAM
+        return CommonInit(frozen_params, params, scan_map, es_map)
+
+    @classmethod
+    def _forward(cls, common_params, *args, **kwargs):
+        return common_params.noiser.get_noisy_conv2d(
+            common_params.frozen_noiser_params,
+            common_params.noiser_params,
+            common_params.params,
+            common_params.es_tree_key,
+            common_params.iterinfo,
+        )
 
 class Linear(Model):
     @classmethod
