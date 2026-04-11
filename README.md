@@ -30,10 +30,10 @@ Fitness: negative cross-entropy on spike counts. All weight matrices optimized v
 ```bash
 # Setup
 uv venv
-uv pip install -e ".[cuda12]"
+uv pip install -e ".[cuda13]"
 
 # Optional: other JAX install targets (match your driver / GPU)
-# uv pip install -e ".[cuda13]"
+# uv pip install -e ".[cuda12]"
 # uv pip install -e ".[cpu]"
 
 # Train (best config, ~60 min on RTX 4080)
@@ -76,10 +76,10 @@ DATASET=cifar10 MODEL_NAME=spiking_resnet18 make smoke-runpod
 Both paths run the same Python training entry point through environment profiles in
 `env/local.env` and `env/runpod.env`.
 
-Local bootstrap defaults to the JAX `cuda12` extra via `env/local.env`, and
+Local bootstrap defaults to the JAX `cuda13` extra via `env/local.env`, and
 `REQUIRE_ACCELERATOR=1` so `make doctor-local` fails if JAX only sees CPU (training
 is intended to run on GPU). For CPU-only machines, set `REQUIRE_ACCELERATOR=0` or
-install with `.[cpu]`. Runpod defaults to `cuda13` via `env/runpod.env`. Override
+install with `.[cpu]`. Runpod also defaults to `cuda13` via `env/runpod.env`. Override
 `SPIKYEGGROLL_INSTALL_TARGET` if you need a different JAX wheel.
 
 Long-running jobs now emit:
