@@ -146,3 +146,74 @@ class SpikingResNet18Model(Model):
             )
 
         return accum
+
+    @classmethod
+    def forward_debug(cls, common_params: CommonParams, x):
+        """Debug forward pass that reports spike-rate statistics.
+
+        This intentionally mirrors the eval-mode forward path and does not
+        support perturbed layer-1 base precomputation.
+        """
+        bsz = x.shape[0]
+        beta = common_params.frozen_params["beta"]
+        threshold = common_params.frozen_params["threshold"]
+        use_membrane = common_params.frozen_params["membrane_readout"]
+        n_blocks = int(common_params.frozen_params["resnet_blocks"])
+        width = int(common_params.frozen_params["resnet_width"])
+        n_classes = common_params.params["linear_out"]["weight"].shape[0]
+
+        v_stem = jnp.zeros((bsz, width))
+        v_out = jnp.zeros((bsz, n_classes))
+        v_block_a = jnp.zeros((n_blocks, bsz, width))
+        v_block_b = jnp.zeros((n_blocks, bsz, width))
+        v_block_res = jnp.zeros((n_blocks, bsz, width))
+        accum = jnp.zeros((bsz, n_classes))
+
+        stem_rates = []
+        out_rates = []
+        block_a_rates = [[] for _ in range(n_blocks)]
+        block_b_rates = [[] for _ in range(n_blocks)]
+        block_res_rates = [[] for _ in range(n_blocks)]
+
+        x_t = jnp.transpose(x, (1, 0, 2))
+        for x_step in x_t:
+            i_stem = call_submodule(Linear, "linear1", common_params, x_step)
+            v_stem, s = lif_step(v_stem, i_stem, beta, threshold)
+            stem_rates.append(jnp.mean(s))
+
+            for i in range(n_blocks):
+                i1 = call_submodule(Linear, f"block{i}_a", common_params, s)
+                v1, s1 = lif_step(v_block_a[i], i1, beta, threshold)
+                v_block_a = v_block_a.at[i].set(v1)
+                block_a_rates[i].append(jnp.mean(s1))
+
+                i2 = call_submodule(Linear, f"block{i}_b", common_params, s1)
+                v2, s2 = lif_step(v_block_b[i], i2, beta, threshold)
+                v_block_b = v_block_b.at[i].set(v2)
+                block_b_rates[i].append(jnp.mean(s2))
+
+                v3, s = lif_step(v_block_res[i], s + s2, beta, threshold)
+                v_block_res = v_block_res.at[i].set(v3)
+                block_res_rates[i].append(jnp.mean(s))
+
+            i_out = call_submodule(Linear, "linear_out", common_params, s)
+            v_out, s_out = lif_step(v_out, i_out, beta, threshold)
+            out_rates.append(jnp.mean(s_out))
+            accum = accum + (v_out if use_membrane else s_out)
+
+        def _as_float_list(values):
+            return [float(v) for v in values]
+
+        stats = {
+            "stem_spike_rates": _as_float_list(stem_rates),
+            "out_spike_rates": _as_float_list(out_rates),
+            "block_a_spike_rates": [_as_float_list(v) for v in block_a_rates],
+            "block_b_spike_rates": [_as_float_list(v) for v in block_b_rates],
+            "block_res_spike_rates": [_as_float_list(v) for v in block_res_rates],
+            "output_nonzero_fraction": float(jnp.mean(accum != 0)),
+            "output_mean": float(jnp.mean(accum)),
+            "output_max": float(jnp.max(accum)),
+            "output_class_variance_mean": float(jnp.mean(jnp.var(accum, axis=-1))),
+            "sample_output_row_sums": [float(v) for v in jnp.sum(accum, axis=-1)[:8]],
+        }
+        return accum, stats
