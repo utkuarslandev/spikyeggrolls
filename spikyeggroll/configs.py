@@ -54,6 +54,7 @@ class SNNConfig:
     )
     resnet_norm: str = "group"
     resnet_norm_groups: int = 8
+    resnet_threshold_scale: bool = False  # if True, stage i uses threshold * 2**i
 
     # Run artifacts
     run_name: str = "default"

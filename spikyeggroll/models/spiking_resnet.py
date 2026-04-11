@@ -146,6 +146,7 @@ class BasicBlock(Model):
         out_channels: int,
         stride: int,
         cfg: SNNConfig,
+        stage_threshold: float | None = None,
     ):
         k1, k2, k3, k4, k5 = jax.random.split(key, 5)
         init = merge_inits(
@@ -196,7 +197,8 @@ class BasicBlock(Model):
                 {**init.es_map, "shortcut": shortcut_init.es_map},
             )
 
-        init = merge_frozen(init, beta=cfg.beta, threshold=cfg.threshold)
+        effective_threshold = stage_threshold if stage_threshold is not None else cfg.threshold
+        init = merge_frozen(init, beta=cfg.beta, threshold=effective_threshold)
         init.params["norm2"]["weight"] = jnp.zeros_like(init.params["norm2"]["weight"])
         return init
 
@@ -204,30 +206,37 @@ class BasicBlock(Model):
     def _forward(cls, common_params: CommonParams, x, state, collect_stats: bool = False):
         beta = common_params.frozen_params["beta"]
         threshold = common_params.frozen_params["threshold"]
-        v1, v2 = state
-        shortcut = x
+        v1, v2, v_sc = state  # v_sc: shortcut membrane (SEW pattern)
 
+        # Main branch: conv1 → norm1 → LIF1
         out = call_submodule(Conv2d, "conv1", common_params, x)
         out = call_submodule(GroupNorm2d, "norm1", common_params, out)
         v1, s1 = lif_step(v1, out, beta, threshold)
 
+        # Main branch: conv2 → norm2 → LIF2
         out = call_submodule(Conv2d, "conv2", common_params, s1)
         out = call_submodule(GroupNorm2d, "norm2", common_params, out)
         v2, s2 = lif_step(v2, out, beta, threshold)
 
+        # Shortcut branch: optional projection, then LIF (SEW-ResNet pattern)
+        # Both branches are binary before addition: out ∈ {0, 1, 2}
+        shortcut_pre = x
         if "shortcut" in common_params.params:
-            shortcut = call_submodule(ProjectionShortcut, "shortcut", common_params, x)
+            shortcut_pre = call_submodule(ProjectionShortcut, "shortcut", common_params, x)
+        v_sc, s_sc = lif_step(v_sc, shortcut_pre, beta, threshold)
 
-        out = shortcut + s2
+        out = s_sc + s2
+
         if collect_stats:
             stats = {
                 "conv1_rate": jnp.mean(s1),
                 "conv2_rate": jnp.mean(s2),
+                "shortcut_rate": jnp.mean(s_sc),
                 "block_output_nonzero_fraction": jnp.mean(out != 0),
             }
-            return out, (v1, v2), stats
+            return out, (v1, v2, v_sc), stats
 
-        return out, (v1, v2)
+        return out, (v1, v2, v_sc)
 
 
 class SpikingResNet18Model(Model):
@@ -246,9 +255,10 @@ class SpikingResNet18Model(Model):
             )
         if cfg.resnet_norm != "group":
             raise ValueError("Only resnet_norm='group' is supported for spiking_resnet18.")
-        if tuple(cfg.resnet_block_counts) != cls.STAGE_BLOCKS:
+        if len(cfg.resnet_block_counts) != len(cls.STAGE_BLOCKS):
             raise ValueError(
-                "spiking_resnet18 requires resnet_block_counts=(2, 2, 2, 2)."
+                f"spiking_resnet18 requires exactly {len(cls.STAGE_BLOCKS)} stages, "
+                f"got resnet_block_counts={cfg.resnet_block_counts}."
             )
 
         dtype = cfg.dtype
@@ -281,11 +291,13 @@ class SpikingResNet18Model(Model):
         key_idx = 3
         in_channels = base_channels
         for stage_idx, (out_channels, block_count) in enumerate(zip(stage_channels, stage_blocks)):
+            stage_threshold = cfg.threshold * (2 ** stage_idx) if cfg.resnet_threshold_scale else None
             for block_idx in range(block_count):
                 stride = 2 if stage_idx > 0 and block_idx == 0 else 1
                 name = f"stage{stage_idx}_block{block_idx}"
                 all_inits[name] = BasicBlock.rand_init(
-                    keys[key_idx], in_channels, out_channels, stride, cfg
+                    keys[key_idx], in_channels, out_channels, stride, cfg,
+                    stage_threshold=stage_threshold,
                 )
                 in_channels = out_channels
                 key_idx += 1
@@ -302,6 +314,7 @@ class SpikingResNet18Model(Model):
             resnet_channels_base=base_channels,
             resnet_norm=cfg.resnet_norm,
             resnet_norm_groups=cfg.resnet_norm_groups,
+            resnet_threshold_scale=cfg.resnet_threshold_scale,
         )
         return init
 
@@ -314,7 +327,7 @@ class SpikingResNet18Model(Model):
                 stride = 2 if stage_idx > 0 and block_idx == 0 else 1
                 spatial = _conv_out_dim(spatial, 3, stride, 1)
                 shape = (batch_size, out_channels, spatial, spatial)
-                states.append((jnp.zeros(shape), jnp.zeros(shape)))
+                states.append((jnp.zeros(shape), jnp.zeros(shape), jnp.zeros(shape)))
         return tuple(states)
 
     @classmethod

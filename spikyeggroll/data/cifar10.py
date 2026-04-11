@@ -10,19 +10,52 @@ def _normalize_cifar(images: np.ndarray) -> np.ndarray:
     return images.astype(np.float32) / 255.0
 
 
+def _random_horizontal_flip(images, key):
+    """Randomly flip [B, H, W, C] images horizontally, independently per image."""
+    flip_mask = jax.random.bernoulli(key, 0.5, shape=(images.shape[0],))
+    return jnp.where(flip_mask[:, None, None, None], jnp.flip(images, axis=2), images)
+
+
+def _random_crop(images, key, pad=4):
+    """Pad by `pad` pixels each side (reflect), then random-crop back to original size."""
+    B, H, W, C = images.shape
+    padded = jnp.pad(images, ((0, 0), (pad, pad), (pad, pad), (0, 0)), mode="reflect")
+    keys = jax.random.split(key, B)
+
+    def crop_one(img, k):
+        offsets = jax.random.randint(k, shape=(2,), minval=0, maxval=2 * pad)
+        return jax.lax.dynamic_slice(img, (offsets[0], offsets[1], 0), (H, W, C))
+
+    return jax.vmap(crop_one)(padded, keys)
+
+
+def augment_batch(images, key):
+    """Standard CIFAR-10 augmentation: random crop (pad=4) + random horizontal flip.
+
+    Args:
+        images: [B, H, W, C] float32 in [0, 1]
+        key: JAX PRNG key
+
+    Returns:
+        [B, H, W, C] float32 in [0, 1]
+    """
+    k1, k2 = jax.random.split(key)
+    images = _random_crop(images, k1, pad=4)
+    images = _random_horizontal_flip(images, k2)
+    return images
+
+
 def load_cifar10(path: str = "data/cifar10", augment: bool = False):
     """Load CIFAR-10 images and labels.
 
     Args:
         path: directory to store/load the dataset
-        augment: currently unsupported placeholder
+        augment: unused at load time; augmentation is applied per-batch via augment_batch()
 
     Returns:
         (train_images [N,32,32,3] float32 in [0,1], train_labels [N] int32,
          test_images, test_labels)
     """
-    if augment:
-        raise NotImplementedError("CIFAR-10 augmentation is not implemented.")
     from torchvision import datasets
 
     train_dataset = datasets.CIFAR10(root=path, train=True, download=True)

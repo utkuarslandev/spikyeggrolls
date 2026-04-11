@@ -11,7 +11,7 @@ import optax
 def get_lora_update_params(frozen_noiser_params, base_sigma, iterinfo, param, key):
     epoch, thread_id = iterinfo
 
-    true_epoch = 0 if frozen_noiser_params["noise_reuse"] == 0 else epoch // frozen_noiser_params["noise_reuse"]
+    true_epoch = epoch if frozen_noiser_params["noise_reuse"] == 0 else epoch // frozen_noiser_params["noise_reuse"]
 
     true_thread_idx = thread_id // 2
     sigma = jnp.where(thread_id % 2 == 0, base_sigma, -base_sigma)
@@ -27,7 +27,7 @@ def get_lora_update_params(frozen_noiser_params, base_sigma, iterinfo, param, ke
 def get_nonlora_update_params(frozen_noiser_params, base_sigma, iterinfo, param, key):
     epoch, thread_id = iterinfo
 
-    true_epoch = 0 if frozen_noiser_params["noise_reuse"] == 0 else epoch // frozen_noiser_params["noise_reuse"]
+    true_epoch = epoch if frozen_noiser_params["noise_reuse"] == 0 else epoch // frozen_noiser_params["noise_reuse"]
 
     true_thread_idx = thread_id // 2
     sigma = jnp.where(thread_id % 2 == 0, base_sigma, -base_sigma)
@@ -54,7 +54,6 @@ def _simple_lora_update(base_sigma, param, key, scores, iterinfo, frozen_noiser_
     broadcasted_scores = jnp.reshape(scores, scores.shape + (1,1))
     A = broadcasted_scores * A # N x a x r for A vs N x b x r for B -> final update is just a x b
     num_envs = scores.shape[0]
-    print("LORA UPDATE", A.shape, B.shape)
     # return A.T @ B / num_envs
     return jnp.einsum('nir,njr->ij', A, B) / num_envs
 
@@ -131,7 +130,7 @@ class EggRoll(Noiser):
             true_scores = (raw_scores - jnp.mean(raw_scores, keepdims=True)) / jnp.sqrt(jnp.var(raw_scores, keepdims=True) + 1e-5)
         else:
             group_scores = raw_scores.reshape((-1, group_size))
-            true_scores = (group_scores - jnp.mean(group_scores, axis=-1, keepdims=True)) / jnp.sqrt(jnp.var(raw_scores, keepdims=True) + 1e-5)
+            true_scores = (group_scores - jnp.mean(group_scores, axis=-1, keepdims=True)) / jnp.sqrt(jnp.var(group_scores, axis=-1, keepdims=True) + 1e-5)
             true_scores = true_scores.ravel()
         # fitness = jax.nn.softmax(true_scores)
         # return fitness * raw_scores.size

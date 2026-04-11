@@ -17,6 +17,7 @@ from hyperscalees.noiser.eggroll import EggRoll
 from hyperscalees.models.common import simple_es_tree_key
 
 from spikyeggroll.configs import SNNConfig
+from spikyeggroll.data.cifar10 import augment_batch as _augment_cifar
 from spikyeggroll.runtime import get_dataset_spec, get_model_cls
 
 
@@ -190,9 +191,11 @@ def train(cfg: SNNConfig = None):
 
     @jax.jit
     def sample_and_encode(images, labels, key):
-        k1, k2 = jax.random.split(key)
+        k1, k2, k3 = jax.random.split(key, 3)
         indices = jax.random.choice(k1, images.shape[0], shape=(_batch_size,), replace=False)
         batch_imgs = images[indices]
+        if _do_augment:  # Python bool — evaluated at trace time, dead-code-eliminated if False
+            batch_imgs = _augment_cifar(batch_imgs, k3)
         spikes = encode_batch_fn(batch_imgs, _timesteps, k2)
         return spikes, labels[indices]
 
@@ -210,6 +213,9 @@ def train(cfg: SNNConfig = None):
         )
     print(f"EGGROLL: pop={N}, rank={cfg.rank}, sigma={cfg.sigma}, lr={cfg.lr}")
     print(f"Run: {cfg.run_name} | metrics: {metrics_path} | checkpoints: {checkpoint_dir}")
+
+    # Augmentation: only for CIFAR-10, evaluated at Python trace time (JIT-safe constant)
+    _do_augment = cfg.augment and cfg.dataset == "cifar10"
 
     # Precompute layer 1 base: x @ W1.T for all timesteps (shared across population)
     @jax.jit
@@ -478,6 +484,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resnet_channels_base", type=int, default=None)
     parser.add_argument("--resnet_norm", type=str, default=None, choices=["group"])
     parser.add_argument("--resnet_norm_groups", type=int, default=None)
+    parser.add_argument("--resnet_threshold_scale", action="store_true", help="Scale threshold by 2**stage_idx per stage")
     parser.add_argument("--pop_size", type=int, default=None)
     parser.add_argument("--rank", type=int, default=None)
     parser.add_argument("--sigma", type=float, default=None)
@@ -537,6 +544,7 @@ def build_config_from_args(args) -> SNNConfig:
             if args.resnet_norm_groups is not None
             else base_cfg.resnet_norm_groups
         ),
+        resnet_threshold_scale=args.resnet_threshold_scale,
         n_classes=base_cfg.n_classes,
         timesteps=args.timesteps if args.timesteps is not None else base_cfg.timesteps,
         pop_size=args.pop_size if args.pop_size is not None else base_cfg.pop_size,
