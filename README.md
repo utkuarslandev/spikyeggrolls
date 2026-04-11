@@ -99,8 +99,13 @@ Effective runtime settings are resolved in this order:
 
 1. explicit environment variable overrides (for example `POP_SIZE=4096 make tune-runpod`)
 2. preset defaults in `scripts/run_train.sh` (`smoke`, `tune`, `full`)
-3. CLI defaults in `spikyeggroll/train.py` when running `python -m spikyeggroll.train` directly
-4. `SNNConfig` defaults in `spikyeggroll/configs.py` when `train()` is called programmatically
+3. explicit CLI flags in `spikyeggroll/train.py` when running `python -m spikyeggroll.train` directly
+4. dataset-derived defaults for `n_inputs`, `in_channels`, and `image_size`
+5. `SNNConfig` defaults in `spikyeggroll/configs.py`
+
+When no CLI flag is provided, direct `python -m spikyeggroll.train` execution now
+inherits baseline defaults from `SNNConfig` instead of a second, partially
+duplicated set of argparse defaults.
 
 Preset defaults in `scripts/run_train.sh`:
 

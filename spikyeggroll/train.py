@@ -17,10 +17,7 @@ from hyperscalees.noiser.eggroll import EggRoll
 from hyperscalees.models.common import simple_es_tree_key
 
 from spikyeggroll.configs import SNNConfig
-from spikyeggroll.models.snn import SNNModel
-from spikyeggroll.models.spiking_resnet import SpikingResNet18Model
-from spikyeggroll.data.mnist import load_mnist, encode_batch
-from spikyeggroll.data.cifar10 import load_cifar10, encode_batch as encode_cifar_batch
+from spikyeggroll.runtime import get_dataset_spec, get_model_cls
 
 
 def _tree_to_numpy(tree):
@@ -97,34 +94,6 @@ def compute_fitness(spike_counts, labels):
     return -ce
 
 
-def _get_dataset_ops(cfg: SNNConfig):
-    if cfg.dataset == "mnist":
-        return (
-            lambda: load_mnist(cfg.data_path + "/mnist"),
-            encode_batch,
-            784,
-            1,
-            28,
-        )
-    if cfg.dataset == "cifar10":
-        return (
-            lambda: load_cifar10(cfg.data_path + "/cifar10", augment=cfg.augment),
-            encode_cifar_batch,
-            32 * 32 * 3,
-            3,
-            32,
-        )
-    raise ValueError(f"Unsupported dataset '{cfg.dataset}'.")
-
-
-def _get_model_cls(cfg: SNNConfig):
-    if cfg.model_name == "mlp_snn":
-        return SNNModel
-    if cfg.model_name == "spiking_resnet18":
-        return SpikingResNet18Model
-    raise ValueError(f"Unsupported model_name '{cfg.model_name}'.")
-
-
 def train(cfg: SNNConfig = None):
     """Run EGGROLL training.
 
@@ -151,7 +120,7 @@ def train(cfg: SNNConfig = None):
     es_key = jax.random.fold_in(key, 1)
     data_key = jax.random.fold_in(key, 2)
 
-    model_cls = _get_model_cls(cfg)
+    model_cls = get_model_cls(cfg.model_name)
 
     # Initialize model
     frozen_params, params, scan_map, es_map = model_cls.rand_init(model_key, cfg)
@@ -193,8 +162,12 @@ def train(cfg: SNNConfig = None):
         )
 
     # Load dataset
-    load_data_fn, encode_batch_fn, default_n_inputs, default_channels, default_img = _get_dataset_ops(cfg)
-    train_data, train_labels, test_data, test_labels = load_data_fn()
+    dataset_spec = get_dataset_spec(cfg)
+    train_data, train_labels, test_data, test_labels = dataset_spec.loader()
+    encode_batch_fn = dataset_spec.encoder
+    default_n_inputs = dataset_spec.n_inputs
+    default_channels = dataset_spec.in_channels
+    default_img = dataset_spec.image_size
     if cfg.in_channels != default_channels or cfg.image_size != default_img:
         print(
             f"Warning: cfg image settings ({cfg.in_channels}ch, {cfg.image_size}px) "
@@ -479,89 +452,103 @@ def train(cfg: SNNConfig = None):
     return frozen_params, params, noiser_params, test_acc
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train SNN with EGGROLL")
-    parser.add_argument("--dataset", type=str, default="mnist", choices=["mnist", "cifar10"])
-    parser.add_argument("--model_name", type=str, default="mlp_snn", choices=["mlp_snn", "spiking_resnet18"])
+    parser.add_argument("--dataset", type=str, default=None, choices=["mnist", "cifar10"])
+    parser.add_argument("--model_name", type=str, default=None, choices=["mlp_snn", "spiking_resnet18"])
     parser.add_argument("--N", type=int, default=None, help="Override n_inputs")
-    parser.add_argument("--hidden_size", type=int, default=128)
-    parser.add_argument("--resnet_width", type=int, default=768)
-    parser.add_argument("--resnet_blocks", type=int, default=8)
-    parser.add_argument("--pop_size", type=int, default=256)
-    parser.add_argument("--rank", type=int, default=1)
-    parser.add_argument("--sigma", type=float, default=0.02)
-    parser.add_argument("--lr", type=float, default=0.005)
-    parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--chunk_size", type=int, default=0, help="Chunk population eval (0=no chunking)")
-    parser.add_argument("--epochs", type=int, default=500)
+    parser.add_argument("--hidden_size", type=int, default=None)
+    parser.add_argument("--resnet_width", type=int, default=None)
+    parser.add_argument("--resnet_blocks", type=int, default=None)
+    parser.add_argument("--pop_size", type=int, default=None)
+    parser.add_argument("--rank", type=int, default=None)
+    parser.add_argument("--sigma", type=float, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--chunk_size", type=int, default=None, help="Chunk population eval (0=no chunking)")
+    parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--timesteps", type=int, default=None)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--threshold", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--threshold", type=float, default=None)
     parser.add_argument("--membrane_readout", action="store_true", help="Use accumulated membrane V as logits")
     parser.add_argument("--escape_noise", action="store_true", help="Stochastic LIF (for SG baseline only)")
-    parser.add_argument("--escape_beta", type=float, default=50.0)
-    parser.add_argument("--escape_lambda0", type=float, default=1.0)
-    parser.add_argument("--data_path", type=str, default="data")
+    parser.add_argument("--escape_beta", type=float, default=None)
+    parser.add_argument("--escape_lambda0", type=float, default=None)
+    parser.add_argument("--data_path", type=str, default=None)
     parser.add_argument("--in_channels", type=int, default=None)
     parser.add_argument("--image_size", type=int, default=None)
     parser.add_argument("--augment", action="store_true")
-    parser.add_argument("--num_test_eval_samples", type=int, default=0)
-    parser.add_argument("--run_name", type=str, default="default")
-    parser.add_argument("--log_dir", type=str, default="logs/spikyeggroll")
-    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints/spikyeggroll")
+    parser.add_argument("--num_test_eval_samples", type=int, default=None)
+    parser.add_argument("--run_name", type=str, default=None)
+    parser.add_argument("--log_dir", type=str, default=None)
+    parser.add_argument("--checkpoint_dir", type=str, default=None)
     parser.add_argument("--resume_from", type=str, default=None)
-    parser.add_argument("--log_interval", type=int, default=10)
-    parser.add_argument("--test_interval", type=int, default=100)
-    parser.add_argument("--checkpoint_interval", type=int, default=100)
-    args = parser.parse_args()
+    parser.add_argument("--log_interval", type=int, default=None)
+    parser.add_argument("--test_interval", type=int, default=None)
+    parser.add_argument("--checkpoint_interval", type=int, default=None)
+    return parser
+
+
+def build_config_from_args(args) -> SNNConfig:
+    base_cfg = SNNConfig()
+    dataset = args.dataset or base_cfg.dataset
 
     dataset_defaults = {
         "mnist": {"n_inputs": 784, "in_channels": 1, "image_size": 28},
         "cifar10": {"n_inputs": 3072, "in_channels": 3, "image_size": 32},
     }
-    dflt = dataset_defaults[args.dataset]
-    n_inputs = args.N or dflt["n_inputs"]
-    n_classes = 10
-    timesteps = args.timesteps or 25
-    in_channels = args.in_channels or dflt["in_channels"]
-    image_size = args.image_size or dflt["image_size"]
+    dflt = dataset_defaults[dataset]
 
-    cfg = SNNConfig(
-        dataset=args.dataset,
-        model_name=args.model_name,
-        n_inputs=n_inputs,
-        hidden_size=args.hidden_size,
-        resnet_width=args.resnet_width,
-        resnet_blocks=args.resnet_blocks,
-        n_classes=n_classes,
-        timesteps=timesteps,
-        pop_size=args.pop_size,
-        rank=args.rank,
-        sigma=args.sigma,
-        lr=args.lr,
-        batch_size=args.batch_size,
-        num_epochs=args.epochs,
-        chunk_size=args.chunk_size,
-        threshold=args.threshold,
+    # Precedence: explicit CLI value > dataset-derived default > SNNConfig default.
+    return SNNConfig(
+        dataset=dataset,
+        model_name=args.model_name or base_cfg.model_name,
+        n_inputs=args.N if args.N is not None else dflt["n_inputs"],
+        hidden_size=args.hidden_size if args.hidden_size is not None else base_cfg.hidden_size,
+        resnet_width=args.resnet_width if args.resnet_width is not None else base_cfg.resnet_width,
+        resnet_blocks=args.resnet_blocks if args.resnet_blocks is not None else base_cfg.resnet_blocks,
+        n_classes=base_cfg.n_classes,
+        timesteps=args.timesteps if args.timesteps is not None else base_cfg.timesteps,
+        pop_size=args.pop_size if args.pop_size is not None else base_cfg.pop_size,
+        rank=args.rank if args.rank is not None else base_cfg.rank,
+        sigma=args.sigma if args.sigma is not None else base_cfg.sigma,
+        lr=args.lr if args.lr is not None else base_cfg.lr,
+        batch_size=args.batch_size if args.batch_size is not None else base_cfg.batch_size,
+        num_epochs=args.epochs if args.epochs is not None else base_cfg.num_epochs,
+        chunk_size=args.chunk_size if args.chunk_size is not None else base_cfg.chunk_size,
+        threshold=args.threshold if args.threshold is not None else base_cfg.threshold,
         membrane_readout=args.membrane_readout,
         escape_noise=args.escape_noise,
-        escape_beta=args.escape_beta,
-        escape_lambda0=args.escape_lambda0,
-        seed=args.seed,
-        data_path=args.data_path,
-        in_channels=in_channels,
-        image_size=image_size,
+        escape_beta=args.escape_beta if args.escape_beta is not None else base_cfg.escape_beta,
+        escape_lambda0=args.escape_lambda0 if args.escape_lambda0 is not None else base_cfg.escape_lambda0,
+        seed=args.seed if args.seed is not None else base_cfg.seed,
+        data_path=args.data_path or base_cfg.data_path,
+        in_channels=args.in_channels if args.in_channels is not None else dflt["in_channels"],
+        image_size=args.image_size if args.image_size is not None else dflt["image_size"],
         augment=args.augment,
-        num_test_eval_samples=args.num_test_eval_samples,
-        run_name=args.run_name,
-        log_dir=args.log_dir,
-        checkpoint_dir=args.checkpoint_dir,
+        num_test_eval_samples=(
+            args.num_test_eval_samples
+            if args.num_test_eval_samples is not None
+            else base_cfg.num_test_eval_samples
+        ),
+        run_name=args.run_name or base_cfg.run_name,
+        log_dir=args.log_dir or base_cfg.log_dir,
+        checkpoint_dir=args.checkpoint_dir or base_cfg.checkpoint_dir,
         resume_from=args.resume_from,
-        log_interval=args.log_interval,
-        test_interval=args.test_interval,
-        checkpoint_interval=args.checkpoint_interval,
+        log_interval=args.log_interval if args.log_interval is not None else base_cfg.log_interval,
+        test_interval=args.test_interval if args.test_interval is not None else base_cfg.test_interval,
+        checkpoint_interval=(
+            args.checkpoint_interval
+            if args.checkpoint_interval is not None
+            else base_cfg.checkpoint_interval
+        ),
     )
 
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    cfg = build_config_from_args(args)
     train(cfg)
 
 
