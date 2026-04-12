@@ -3,6 +3,7 @@
 import argparse
 from collections import deque
 import json
+import os
 import pickle
 import time
 from dataclasses import asdict
@@ -118,6 +119,26 @@ def summarize_output_activity(outputs):
     }
 
 
+def _trace_enabled():
+    return os.environ.get("SPIKYEGGROLL_TRACE_STARTUP", "0") == "1"
+
+
+def trace_startup(label: str):
+    if _trace_enabled():
+        print(
+            f"[startup {time.strftime('%Y-%m-%d %H:%M:%S')}] {label}",
+            flush=True,
+        )
+
+
+def trace_block(label: str, value):
+    if _trace_enabled():
+        trace_startup(f"{label}: waiting for device")
+        jax.block_until_ready(value)
+        trace_startup(f"{label}: device ready")
+    return value
+
+
 def train(cfg: SNNConfig = None):
     """Run EGGROLL training.
 
@@ -134,6 +155,7 @@ def train(cfg: SNNConfig = None):
     checkpoint_dir = Path(cfg.checkpoint_dir)
     metrics_path = log_dir / f"{cfg.run_name}.metrics.jsonl"
     summary_path = log_dir / f"{cfg.run_name}.summary.json"
+    trace_startup(f"train() begin run_name={cfg.run_name}")
 
     N = cfg.pop_size
     assert N % 2 == 0, "Population size must be even (antithetical sampling)"
@@ -147,10 +169,13 @@ def train(cfg: SNNConfig = None):
     model_cls = get_model_cls(cfg.model_name)
 
     # Initialize model
+    trace_startup("initializing model")
     frozen_params, params, scan_map, es_map = model_cls.rand_init(model_key, cfg)
+    trace_startup("model init complete")
     es_tree_key = simple_es_tree_key(params, es_key, scan_map)
 
     # Initialize EGGROLL noiser
+    trace_startup("initializing noiser")
     frozen_noiser_params, noiser_params = EggRoll.init_noiser(
         params,
         cfg.sigma,
@@ -161,6 +186,7 @@ def train(cfg: SNNConfig = None):
         use_batched_update=cfg.use_batched_update,
         fitness_shaping=cfg.fitness_shaping,
     )
+    trace_startup("noiser init complete")
 
     start_epoch = 0
     global_update = 0
@@ -170,6 +196,7 @@ def train(cfg: SNNConfig = None):
     pending_batch_keys = []
 
     if cfg.resume_from:
+        trace_startup(f"loading checkpoint {cfg.resume_from}")
         checkpoint = load_checkpoint(cfg.resume_from)
         params = checkpoint["params"]
         noiser_params = checkpoint["noiser_params"]
@@ -193,8 +220,12 @@ def train(cfg: SNNConfig = None):
         )
 
     # Load dataset
+    trace_startup("loading dataset")
     dataset_spec = get_dataset_spec(cfg)
     train_data, train_labels, test_data, test_labels = dataset_spec.loader()
+    trace_startup(
+        f"dataset loaded train={train_data.shape} test={test_data.shape}"
+    )
     encode_batch_fn = dataset_spec.encoder
     default_n_inputs = dataset_spec.n_inputs
     default_channels = dataset_spec.in_channels
@@ -259,6 +290,7 @@ def train(cfg: SNNConfig = None):
     _do_augment = cfg.augment and cfg.dataset == "cifar10"
 
     # Precompute layer 1 base: x @ W1.T for all timesteps (shared across population)
+    trace_startup("building jit wrappers")
     @jax.jit
     def compute_l1_base(params, x):
         """Compute x @ W1.T once, returns [T, B, hidden]."""
@@ -331,6 +363,7 @@ def train(cfg: SNNConfig = None):
                 return score_population_full(noiser_params, params, c_iter, x, l1b, y)
 
             return jax.lax.map(score_chunk, _chunk_starts).reshape(-1)[:N]
+    trace_startup("jit wrappers ready")
 
     def eval_test():
         if n_test_chunks == 0:
@@ -355,6 +388,9 @@ def train(cfg: SNNConfig = None):
         return float(eval_batches(noiser_params, params, eval_inputs, eval_labels))
 
     def build_prefetch_queue(start_key, queued_keys=None):
+        trace_startup(
+            f"prefetch build begin depth={_prefetch_depth} queued={len(queued_keys or [])}"
+        )
         queue = deque()
         next_key = start_key
         batch_keys = list(queued_keys or [])
@@ -364,20 +400,32 @@ def train(cfg: SNNConfig = None):
             batch_keys.append(batch_key)
 
         for batch_key in batch_keys:
+            trace_startup("prefetch sample_and_encode begin")
             x_batch, y_batch = sample_and_encode(train_data, train_labels, batch_key)
+            trace_block("prefetch sample_and_encode", x_batch)
+            trace_block("prefetch labels", y_batch)
             queue.append((batch_key, x_batch, y_batch))
+            trace_startup("prefetch batch enqueued")
 
+        trace_startup("prefetch build complete")
         return queue, next_key
 
     def pop_prefetched_batch(queue, next_key):
         _, x_batch, y_batch = queue.popleft()
         next_key, batch_key = jax.random.split(next_key)
+        trace_startup("next sample_and_encode begin")
         next_x, next_y = sample_and_encode(train_data, train_labels, batch_key)
+        trace_block("next sample_and_encode", next_x)
+        trace_block("next labels", next_y)
         queue.append((batch_key, next_x, next_y))
+        trace_startup("next batch enqueued")
         return x_batch, y_batch, queue, next_key
 
+    trace_startup("starting prefetch queue warmup")
     prefetch_queue, data_key = build_prefetch_queue(data_key, pending_batch_keys)
+    trace_startup("prefetch queue ready")
 
+    trace_startup("writing start metric")
     write_metric(
         metrics_path,
         {
@@ -389,12 +437,14 @@ def train(cfg: SNNConfig = None):
             "global_update": global_update,
         },
     )
+    trace_startup("start metric written")
 
     # Training loop
     t_start = time.time()
     last_completed_epoch = start_epoch - 1
     try:
         for epoch in range(start_epoch, cfg.num_epochs):
+            trace_startup(f"epoch {epoch} begin")
             for _ in range(cfg.updates_per_epoch):
                 x_batch, y_batch, prefetch_queue, data_key = pop_prefetched_batch(
                     prefetch_queue, data_key
@@ -407,7 +457,9 @@ def train(cfg: SNNConfig = None):
                 )
 
                 # Evaluate base params (no noise) on this batch
+                trace_startup("jit_forward_eval begin")
                 val_out = jit_forward_eval(noiser_params, params, x_batch)
+                trace_block("jit_forward_eval", val_out)
                 val_fitness = compute_fitness(val_out, y_batch)
 
                 # Precompute layer 1 base matmul when model exposes linear1
@@ -417,6 +469,7 @@ def train(cfg: SNNConfig = None):
 
                 # Evaluate population (with noise)
                 if _chunk_starts is not None:
+                    trace_startup("score_population_chunked begin")
                     raw_scores = score_population_chunked(
                         noiser_params,
                         params,
@@ -427,9 +480,11 @@ def train(cfg: SNNConfig = None):
                         y_batch,
                     )
                 else:
+                    trace_startup("score_population_full begin")
                     raw_scores = score_population_full(
                         noiser_params, params, iterinfo, x_batch, l1_base, y_batch
                     )
+                trace_block("population scores", raw_scores)
 
                 fitnesses = EggRoll.convert_fitnesses(
                     frozen_noiser_params, noiser_params, raw_scores
@@ -437,9 +492,11 @@ def train(cfg: SNNConfig = None):
                 raw_score_std = float(jnp.std(raw_scores))
 
                 # Update parameters
+                trace_startup("jit_update begin")
                 noiser_params, params = jit_update(
                     noiser_params, params, fitnesses, iterinfo
                 )
+                trace_block("jit_update params", params)
 
                 # 1/5th success rule: adapt sigma based on fraction beating baseline
                 n_better = int(jnp.sum(raw_scores > val_fitness))
