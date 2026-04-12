@@ -5,6 +5,7 @@ from collections import deque
 import json
 import os
 import pickle
+import re
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -123,12 +124,45 @@ def _trace_enabled():
     return os.environ.get("SPIKYEGGROLL_TRACE_STARTUP", "0") == "1"
 
 
+def _profile_enabled():
+    return os.environ.get("SPIKYEGGROLL_PROFILE_STARTUP", "0") == "1"
+
+
+_PROFILE_SNAPSHOT_INDEX = 0
+
+
+def _startup_profile_path(run_name: str, label: str) -> Path:
+    global _PROFILE_SNAPSHOT_INDEX
+    _PROFILE_SNAPSHOT_INDEX += 1
+    root = Path(
+        os.environ.get(
+            "SPIKYEGGROLL_PROFILE_DIR",
+            f"logs/spikyeggroll/profiles/{run_name}",
+        )
+    )
+    safe = re.sub(r"[^a-zA-Z0-9._-]+", "-", label).strip("-") or "snapshot"
+    root.mkdir(parents=True, exist_ok=True)
+    return root / f"{_PROFILE_SNAPSHOT_INDEX:03d}-{safe}.pb"
+
+
 def trace_startup(label: str):
     if _trace_enabled():
         print(
             f"[startup {time.strftime('%Y-%m-%d %H:%M:%S')}] {label}",
             flush=True,
         )
+
+
+def trace_profile(run_name: str, label: str):
+    if not _profile_enabled():
+        return
+    path = _startup_profile_path(run_name, label)
+    trace_startup(f"{label}: saving memory profile -> {path}")
+    try:
+        jax.profiler.save_device_memory_profile(str(path))
+        trace_startup(f"{label}: memory profile saved")
+    except Exception as exc:
+        trace_startup(f"{label}: memory profile failed: {exc}")
 
 
 def trace_block(label: str, value):
@@ -156,6 +190,7 @@ def train(cfg: SNNConfig = None):
     metrics_path = log_dir / f"{cfg.run_name}.metrics.jsonl"
     summary_path = log_dir / f"{cfg.run_name}.summary.json"
     trace_startup(f"train() begin run_name={cfg.run_name}")
+    trace_profile(cfg.run_name, "train-begin")
 
     N = cfg.pop_size
     assert N % 2 == 0, "Population size must be even (antithetical sampling)"
@@ -172,6 +207,7 @@ def train(cfg: SNNConfig = None):
     trace_startup("initializing model")
     frozen_params, params, scan_map, es_map = model_cls.rand_init(model_key, cfg)
     trace_startup("model init complete")
+    trace_profile(cfg.run_name, "model-init-complete")
     es_tree_key = simple_es_tree_key(params, es_key, scan_map)
 
     # Initialize EGGROLL noiser
@@ -187,6 +223,7 @@ def train(cfg: SNNConfig = None):
         fitness_shaping=cfg.fitness_shaping,
     )
     trace_startup("noiser init complete")
+    trace_profile(cfg.run_name, "noiser-init-complete")
 
     start_epoch = 0
     global_update = 0
@@ -226,6 +263,7 @@ def train(cfg: SNNConfig = None):
     trace_startup(
         f"dataset loaded train={train_data.shape} test={test_data.shape}"
     )
+    trace_profile(cfg.run_name, "dataset-loaded")
     encode_batch_fn = dataset_spec.encoder
     default_n_inputs = dataset_spec.n_inputs
     default_channels = dataset_spec.in_channels
@@ -364,6 +402,7 @@ def train(cfg: SNNConfig = None):
 
             return jax.lax.map(score_chunk, _chunk_starts).reshape(-1)[:N]
     trace_startup("jit wrappers ready")
+    trace_profile(cfg.run_name, "jit-wrappers-ready")
 
     def eval_test():
         if n_test_chunks == 0:
@@ -404,6 +443,7 @@ def train(cfg: SNNConfig = None):
             x_batch, y_batch = sample_and_encode(train_data, train_labels, batch_key)
             trace_block("prefetch sample_and_encode", x_batch)
             trace_block("prefetch labels", y_batch)
+            trace_profile(cfg.run_name, "prefetch-batch-ready")
             queue.append((batch_key, x_batch, y_batch))
             trace_startup("prefetch batch enqueued")
 
@@ -417,6 +457,7 @@ def train(cfg: SNNConfig = None):
         next_x, next_y = sample_and_encode(train_data, train_labels, batch_key)
         trace_block("next sample_and_encode", next_x)
         trace_block("next labels", next_y)
+        trace_profile(cfg.run_name, "next-batch-ready")
         queue.append((batch_key, next_x, next_y))
         trace_startup("next batch enqueued")
         return x_batch, y_batch, queue, next_key
@@ -424,6 +465,7 @@ def train(cfg: SNNConfig = None):
     trace_startup("starting prefetch queue warmup")
     prefetch_queue, data_key = build_prefetch_queue(data_key, pending_batch_keys)
     trace_startup("prefetch queue ready")
+    trace_profile(cfg.run_name, "prefetch-ready")
 
     trace_startup("writing start metric")
     write_metric(
@@ -438,6 +480,7 @@ def train(cfg: SNNConfig = None):
         },
     )
     trace_startup("start metric written")
+    trace_profile(cfg.run_name, "start-metric-written")
 
     # Training loop
     t_start = time.time()
@@ -460,6 +503,7 @@ def train(cfg: SNNConfig = None):
                 trace_startup("jit_forward_eval begin")
                 val_out = jit_forward_eval(noiser_params, params, x_batch)
                 trace_block("jit_forward_eval", val_out)
+                trace_profile(cfg.run_name, "jit-forward-eval-ready")
                 val_fitness = compute_fitness(val_out, y_batch)
 
                 # Precompute layer 1 base matmul when model exposes linear1
@@ -485,6 +529,7 @@ def train(cfg: SNNConfig = None):
                         noiser_params, params, iterinfo, x_batch, l1_base, y_batch
                     )
                 trace_block("population scores", raw_scores)
+                trace_profile(cfg.run_name, "population-scores-ready")
 
                 fitnesses = EggRoll.convert_fitnesses(
                     frozen_noiser_params, noiser_params, raw_scores
@@ -497,6 +542,7 @@ def train(cfg: SNNConfig = None):
                     noiser_params, params, fitnesses, iterinfo
                 )
                 trace_block("jit_update params", params)
+                trace_profile(cfg.run_name, "jit-update-ready")
 
                 # 1/5th success rule: adapt sigma based on fraction beating baseline
                 n_better = int(jnp.sum(raw_scores > val_fitness))
