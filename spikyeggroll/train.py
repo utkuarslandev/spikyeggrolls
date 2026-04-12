@@ -715,7 +715,7 @@ def build_config_from_args(args) -> SNNConfig:
         updates_per_epoch=(
             args.updates_per_epoch
             if args.updates_per_epoch is not None
-            else base_cfg.updates_per_epoch)
+            else base_cfg.updates_per_epoch
         ),
         chunk_size=args.chunk_size if args.chunk_size is not None else base_cfg.chunk_size,
         threshold=args.threshold if args.threshold is not None else base_cfg.threshold,
