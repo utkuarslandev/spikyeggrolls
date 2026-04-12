@@ -240,6 +240,19 @@ def train(cfg: SNNConfig = None):
         f"EGGROLL: pop={N}, rank={cfg.rank}, sigma={cfg.sigma}, lr={cfg.lr}, "
         f"shape={cfg.fitness_shaping}, batched_update={cfg.use_batched_update}"
     )
+    total_updates = cfg.num_epochs * cfg.updates_per_epoch
+    total_samples = total_updates * cfg.batch_size
+    if cfg.dataset == "cifar10":
+        print(
+            f"Budget: {cfg.num_epochs} epochs × {cfg.updates_per_epoch} upd/epoch "
+            f"= {total_updates} total updates | "
+            f"~{total_samples:,} samples ({total_samples / 50000:.1f}× CIFAR train set)"
+        )
+    else:
+        print(
+            f"Budget: {cfg.num_epochs} epochs × {cfg.updates_per_epoch} upd/epoch "
+            f"= {total_updates} total updates | ~{total_samples:,} samples"
+        )
     print(f"Run: {cfg.run_name} | metrics: {metrics_path} | checkpoints: {checkpoint_dir}")
 
     # Augmentation: only for CIFAR-10, evaluated at Python trace time (JIT-safe constant)
@@ -702,7 +715,7 @@ def build_config_from_args(args) -> SNNConfig:
         updates_per_epoch=(
             args.updates_per_epoch
             if args.updates_per_epoch is not None
-            else base_cfg.updates_per_epoch
+            else base_cfg.updates_per_epoch)
         ),
         chunk_size=args.chunk_size if args.chunk_size is not None else base_cfg.chunk_size,
         threshold=args.threshold if args.threshold is not None else base_cfg.threshold,

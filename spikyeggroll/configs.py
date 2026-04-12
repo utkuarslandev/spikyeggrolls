@@ -35,7 +35,7 @@ class SNNConfig:
     batch_size: int = 256
     chunk_size: int = 0
     num_epochs: int = 400
-    updates_per_epoch: int = 1
+    updates_per_epoch: int = 10
     seed: int = 0
     log_interval: int = 10
     test_interval: int = 100
