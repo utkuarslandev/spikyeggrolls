@@ -12,6 +12,8 @@ from-scratch convolutional ResNet path replaced the earlier residual MLP path.
   `chunk_size=96`, `resnet_channels_base=32`.
 - The main failure mode has shifted from "dead network" to "slow, unstable
   learning with sigma drift."
+- The implementation roadmap for fixing the remaining CIFAR issues now lives in
+  [docs/cifar-resnet-phased-implementation-plan.md](docs/cifar-resnet-phased-implementation-plan.md).
 
 ## Run History
 

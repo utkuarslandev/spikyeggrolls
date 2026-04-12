@@ -507,3 +507,10 @@ Takeaway:
 - Explore faster update paths and lower precision.
 - Treat larger batch/chunk settings as throughput tuning, not as the main fix
   for poor CIFAR accuracy.
+
+### Planning handoff
+
+- The detailed implementation roadmap for the next CIFAR ResNet work now lives
+  in [docs/cifar-resnet-phased-implementation-plan.md](docs/cifar-resnet-phased-implementation-plan.md).
+- That document is the primary source of truth for phase ordering, acceptance
+  criteria, and the 5090 validation matrix.

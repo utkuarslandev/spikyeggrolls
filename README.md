@@ -125,7 +125,9 @@ current 5090 experiments:
 `DTYPE=bfloat16`, `SIGMA_MAX=0.012`, and `NUM_TEST_EVAL_SAMPLES=1024`.
 
 See [docs/cifar-experiments-log.md](docs/cifar-experiments-log.md) for the
-current CIFAR results and failure modes.
+current CIFAR results and failure modes. The phased implementation roadmap for
+improving CIFAR ResNet training is in
+[docs/cifar-resnet-phased-implementation-plan.md](docs/cifar-resnet-phased-implementation-plan.md).
 
 Population-scaling sweep example (6 settings, 3 seeds each):
 
