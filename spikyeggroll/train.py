@@ -128,6 +128,19 @@ def _profile_enabled():
     return os.environ.get("SPIKYEGGROLL_PROFILE_STARTUP", "0") == "1"
 
 
+def _trace_capture_enabled():
+    return os.environ.get("SPIKYEGGROLL_PROFILE_TRACE", "0") == "1"
+
+
+def _profile_server_port():
+    port = os.environ.get("SPIKYEGGROLL_PROFILE_SERVER_PORT")
+    return int(port) if port else None
+
+
+def _profile_snapshot_limit():
+    return int(os.environ.get("SPIKYEGGROLL_PROFILE_MAX_SNAPSHOTS", "16"))
+
+
 _PROFILE_SNAPSHOT_INDEX = 0
 
 
@@ -155,6 +168,8 @@ def trace_startup(label: str):
 
 def trace_profile(run_name: str, label: str):
     if not _profile_enabled():
+        return
+    if _PROFILE_SNAPSHOT_INDEX >= _profile_snapshot_limit():
         return
     path = _startup_profile_path(run_name, label)
     trace_startup(f"{label}: saving memory profile -> {path}")
@@ -191,6 +206,33 @@ def train(cfg: SNNConfig = None):
     summary_path = log_dir / f"{cfg.run_name}.summary.json"
     trace_startup(f"train() begin run_name={cfg.run_name}")
     trace_profile(cfg.run_name, "train-begin")
+
+    profile_server_port = _profile_server_port()
+    if profile_server_port is not None:
+        jax.profiler.start_server(profile_server_port)
+        trace_startup(f"profiler server listening on port {profile_server_port}")
+
+    trace_dir = Path(
+        os.environ.get(
+            "SPIKYEGGROLL_TRACE_DIR",
+            f"logs/spikyeggroll/traces/{cfg.run_name}",
+        )
+    )
+    startup_trace_active = False
+    startup_trace_complete = False
+    if _trace_capture_enabled():
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        jax.profiler.start_trace(str(trace_dir))
+        startup_trace_active = True
+        trace_startup(f"startup trace started -> {trace_dir}")
+
+    def finish_startup_trace(label: str):
+        nonlocal startup_trace_active, startup_trace_complete
+        if startup_trace_active and not startup_trace_complete:
+            jax.profiler.stop_trace()
+            startup_trace_complete = True
+            startup_trace_active = False
+            trace_startup(f"startup trace stopped at {label}")
 
     N = cfg.pop_size
     assert N % 2 == 0, "Population size must be even (antithetical sampling)"
@@ -543,6 +585,7 @@ def train(cfg: SNNConfig = None):
                 )
                 trace_block("jit_update params", params)
                 trace_profile(cfg.run_name, "jit-update-ready")
+                finish_startup_trace("jit-update-ready")
 
                 # 1/5th success rule: adapt sigma based on fraction beating baseline
                 n_better = int(jnp.sum(raw_scores > val_fitness))
@@ -651,6 +694,7 @@ def train(cfg: SNNConfig = None):
                 )
             last_completed_epoch = epoch
     except KeyboardInterrupt:
+        finish_startup_trace("keyboard-interrupt")
         interrupt_path = save_checkpoint(
             checkpoint_dir,
             cfg.run_name,
@@ -668,6 +712,8 @@ def train(cfg: SNNConfig = None):
         )
         print(f"\nInterrupted. Saved checkpoint: {interrupt_path}")
         raise
+    finally:
+        finish_startup_trace("train-finally")
 
     # Final test accuracy
     test_acc = eval_test()
