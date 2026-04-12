@@ -1,5 +1,6 @@
 """Tests for CIFAR-10 encoding and spiking ResNet wiring."""
 
+import pytest
 import jax
 import jax.numpy as jnp
 
@@ -10,6 +11,7 @@ from spikyeggroll.data.cifar10 import augment_batch, encode_batch
 from spikyeggroll.configs import SNNConfig
 from spikyeggroll.models.spiking_resnet import BasicBlock, SpikingResNet18Model
 from spikyeggroll.train import compute_fitness
+from spikyeggroll.models.snn import SNNModel
 
 
 def test_cifar_encode_batch_shape_and_binary():
@@ -54,7 +56,31 @@ def test_conv_kernel_supports_eval_and_noisy_forward():
     assert jnp.all(jnp.isfinite(noisy))
 
 
-def test_spiking_resnet_forward_shape():
+def _forward_population(model_cls, frozen_noiser_params, noiser_params, frozen_params, params, es_tree_key, x, l1b):
+    return jax.vmap(
+        lambda i: model_cls.forward(
+            EggRoll,
+            frozen_noiser_params,
+            noiser_params,
+            frozen_params,
+            params,
+            es_tree_key,
+            i,
+            x,
+            l1b,
+        )
+    )
+
+
+def _score_population(model_cls, frozen_noiser_params, noiser_params, frozen_params, params, es_tree_key, x, y, l1b):
+    forward_pop = _forward_population(
+        model_cls, frozen_noiser_params, noiser_params, frozen_params, params, es_tree_key, x, l1b
+    )
+    return lambda iterinfo: jax.vmap(compute_fitness, in_axes=(0, None))(forward_pop(iterinfo), y)
+
+
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_spiking_resnet_forward_shape(dtype):
     key = jax.random.key(1)
     k1, k2, k3 = jax.random.split(key, 3)
     cfg = SNNConfig(
@@ -64,6 +90,7 @@ def test_spiking_resnet_forward_shape():
         n_classes=10,
         timesteps=4,
         pop_size=8,
+        dtype=dtype,
     )
     frozen_params, params, scan_map, _ = SpikingResNet18Model.rand_init(k1, cfg)
     es_tree_key = simple_es_tree_key(params, k2, scan_map)
@@ -200,6 +227,56 @@ def test_eval_forward_is_independent_of_batch_companions():
         batch_b,
     )
     assert jnp.allclose(out_a[0], out_b[0], atol=1e-6, rtol=1e-6)
+
+
+def test_chunked_population_scoring_matches_python_loop():
+    key = jax.random.key(21)
+    k1, k2, k3, k4 = jax.random.split(key, 4)
+    cfg = SNNConfig(
+        dataset="mnist",
+        model_name="mlp_snn",
+        n_inputs=8,
+        hidden_size=4,
+        n_classes=2,
+        timesteps=3,
+        pop_size=6,
+    )
+    frozen_params, params, scan_map, _ = SNNModel.rand_init(k1, cfg)
+    es_tree_key = simple_es_tree_key(params, k2, scan_map)
+    frozen_noiser_params, noiser_params = EggRoll.init_noiser(
+        params, cfg.sigma, cfg.lr, rank=cfg.rank
+    )
+    x = jax.random.bernoulli(k3, 0.3, (2, 3, 8)).astype(jnp.float32)
+    y = jax.random.randint(k4, (2,), 0, cfg.n_classes)
+    iterinfo = (jnp.zeros((cfg.pop_size,), dtype=jnp.int32), jnp.arange(cfg.pop_size))
+
+    score_fn = _score_population(
+        SNNModel, frozen_noiser_params, noiser_params, frozen_params, params, es_tree_key, x, y, None
+    )
+
+    expected = []
+    chunk_size = 4
+    for start in range(0, cfg.pop_size, chunk_size):
+        c_iter = (iterinfo[0][start : start + chunk_size], iterinfo[1][start : start + chunk_size])
+        expected.append(score_fn(c_iter))
+    expected = jnp.concatenate(expected)
+
+    pad = (-cfg.pop_size) % chunk_size
+    epoch_ids = jnp.pad(iterinfo[0], (0, pad), mode="edge")
+    thread_ids = jnp.pad(iterinfo[1], (0, pad), mode="edge")
+    starts = jnp.arange(0, cfg.pop_size + pad, chunk_size, dtype=jnp.int32)
+
+    @jax.jit
+    def staged_scores():
+        def score_chunk(start):
+            idx = jnp.arange(chunk_size, dtype=jnp.int32) + start
+            c_iter = (epoch_ids[idx], thread_ids[idx])
+            return score_fn(c_iter)
+
+        return jax.lax.map(score_chunk, starts).reshape(-1)[: cfg.pop_size]
+
+    actual = staged_scores()
+    assert jnp.allclose(expected, actual, atol=1e-6, rtol=1e-6)
 
 
 def test_sew_block_output_is_integer_valued():

@@ -57,4 +57,8 @@ def test_cifar_model_defaults_reflect_debug_baseline_architecture():
     assert cfg.resnet_norm == "group"
     assert cfg.resnet_norm_groups == 8
     assert cfg.sigma_min == 0.001
+    assert cfg.sigma_max == 1.0
     assert cfg.sigma_warmup_epochs == 20
+    assert cfg.updates_per_epoch == 1
+    assert cfg.fitness_shaping == "zscore"
+    assert cfg.use_batched_update is False

@@ -97,12 +97,14 @@ The `runpod` profile sets these defaults:
 
 ```bash
 export JAX_COMPILATION_CACHE_DIR=/workspace/.jax_cache
-export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export XLA_PYTHON_CLIENT_PREALLOCATE=true
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.90
 export REQUIRE_ACCELERATOR=1
 ```
 
-These defaults reduce repeated JIT compile cost and make GPU memory behavior less
-aggressive during iteration.
+These defaults keep the JAX compilation cache warm while preferring preallocated
+HBM on dedicated GPUs. Override `XLA_PYTHON_CLIENT_PREALLOCATE=false` when you
+need the older iterative memory behavior for debugging or tight-fit experiments.
 
 ## Common overrides
 

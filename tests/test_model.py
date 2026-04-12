@@ -3,14 +3,16 @@
 import pytest
 import jax
 import jax.numpy as jnp
+import json
 
 from spikyeggroll.configs import SNNConfig
 from spikyeggroll.eval import evaluate
-from spikyeggroll.train import build_config_from_args, build_parser
+from spikyeggroll.train import build_config_from_args, build_parser, train
 from spikyeggroll.models.snn import SNNModel
 from spikyeggroll.models.spiking_resnet import SpikingResNet18Model
 from hyperscalees.models.common import simple_es_tree_key
 from hyperscalees.noiser.eggroll import EggRoll
+from spikyeggroll.runtime import DatasetSpec
 
 
 def test_rand_init_structure():
@@ -148,9 +150,85 @@ def test_cli_dataset_defaults_switch_with_cifar10():
     assert cfg.pop_size == SNNConfig().pop_size
 
 
+def test_cli_cifar_resnet_defaults_enable_perf_path():
+    parser = build_parser()
+    args = parser.parse_args(["--dataset", "cifar10", "--model_name", "spiking_resnet18"])
+
+    cfg = build_config_from_args(args)
+
+    assert cfg.fitness_shaping == "centered_rank"
+    assert cfg.use_batched_update is True
+    assert cfg.sigma_max == pytest.approx(0.012)
+
+
 def test_cli_rejects_removed_legacy_resnet_flags():
     parser = build_parser()
     with pytest.raises(SystemExit):
         parser.parse_args(["--resnet_width", "128"])
     with pytest.raises(SystemExit):
         parser.parse_args(["--resnet_blocks", "2"])
+
+
+def test_train_updates_per_epoch_and_sigma_max(monkeypatch, tmp_path):
+    def loader():
+        train_images = jnp.linspace(0.0, 1.0, 16 * 8, dtype=jnp.float32).reshape(16, 8)
+        train_labels = (jnp.arange(16) % 2).astype(jnp.int32)
+        test_images = train_images[:8]
+        test_labels = train_labels[:8]
+        return train_images, train_labels, test_images, test_labels
+
+    def encoder(images, timesteps, key):
+        del key
+        return jnp.broadcast_to(images[:, None, :], (images.shape[0], timesteps, images.shape[1]))
+
+    monkeypatch.setattr(
+        "spikyeggroll.train.get_dataset_spec",
+        lambda cfg: DatasetSpec(
+            loader=loader,
+            encoder=encoder,
+            n_inputs=8,
+            in_channels=1,
+            image_size=1,
+        ),
+    )
+
+    cfg = SNNConfig(
+        dataset="mnist",
+        model_name="mlp_snn",
+        n_inputs=8,
+        hidden_size=4,
+        n_classes=2,
+        timesteps=2,
+        pop_size=4,
+        rank=1,
+        sigma=0.02,
+        sigma_min=0.001,
+        sigma_max=0.005,
+        lr=0.001,
+        batch_size=2,
+        chunk_size=2,
+        num_epochs=2,
+        updates_per_epoch=3,
+        sigma_warmup_epochs=0,
+        log_interval=1,
+        test_interval=0,
+        checkpoint_interval=0,
+        run_name="pytest-train-updates",
+        log_dir=str(tmp_path / "logs"),
+        checkpoint_dir=str(tmp_path / "ckpts"),
+    )
+
+    _, _, _, test_acc = train(cfg)
+
+    metrics_path = tmp_path / "logs" / "pytest-train-updates.metrics.jsonl"
+    summary_path = tmp_path / "logs" / "pytest-train-updates.summary.json"
+    records = [json.loads(line) for line in metrics_path.read_text().splitlines() if line.strip()]
+    epoch_records = [r for r in records if r["event"] == "epoch"]
+    summary = json.loads(summary_path.read_text())
+
+    assert len(epoch_records) == 2
+    assert epoch_records[0]["global_update"] == 3
+    assert epoch_records[1]["global_update"] == 6
+    assert all(r["sigma"] <= cfg.sigma_max + 1e-8 for r in epoch_records)
+    assert summary["completed_updates"] == 6
+    assert 0.0 <= test_acc <= 1.0

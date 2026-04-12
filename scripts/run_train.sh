@@ -77,12 +77,19 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 : "${CHECKPOINT_INTERVAL:=100}"
 : "${DATASET:=mnist}"
 : "${MODEL_NAME:=mlp_snn}"
+: "${UPDATES_PER_EPOCH:=1}"
 LOG_FILE="${LOG_DIR}/${RUN_NAME}.stdout.log"
 
 if [ "${DATASET}" = "cifar10" ] && [ "${MODEL_NAME}" = "spiking_resnet18" ]; then
-    : "${TIMESTEPS:=8}"
-    : "${BATCH_SIZE:=64}"
-    : "${CHUNK_SIZE:=128}"
+    : "${TIMESTEPS:=16}"
+    : "${BATCH_SIZE:=32}"
+    : "${CHUNK_SIZE:=96}"
+    : "${UPDATES_PER_EPOCH:=64}"
+    : "${FITNESS_SHAPING:=centered_rank}"
+    : "${USE_BATCHED_UPDATE:=true}"
+    : "${DTYPE:=bfloat16}"
+    : "${SIGMA_MAX:=0.012}"
+    : "${NUM_TEST_EVAL_SAMPLES:=1024}"
 fi
 
 echo "Profile: ${PROFILE}"
@@ -105,6 +112,7 @@ CMD=(
   --epochs "${EPOCHS}" \
   --batch_size "${BATCH_SIZE}" \
   --chunk_size "${CHUNK_SIZE}" \
+  --updates_per_epoch "${UPDATES_PER_EPOCH}" \
   --timesteps "${TIMESTEPS}" \
   --data_path "${DATA_PATH}" \
   --run_name "${RUN_NAME}" \
@@ -114,6 +122,28 @@ CMD=(
   --test_interval "${TEST_INTERVAL}" \
   --checkpoint_interval "${CHECKPOINT_INTERVAL}"
 )
+
+if [ -n "${FITNESS_SHAPING:-}" ]; then
+    CMD+=(--fitness_shaping "${FITNESS_SHAPING}")
+fi
+
+if [ -n "${DTYPE:-}" ]; then
+    CMD+=(--dtype "${DTYPE}")
+fi
+
+if [ -n "${SIGMA_MAX:-}" ]; then
+    CMD+=(--sigma_max "${SIGMA_MAX}")
+fi
+
+if [ -n "${NUM_TEST_EVAL_SAMPLES:-}" ]; then
+    CMD+=(--num_test_eval_samples "${NUM_TEST_EVAL_SAMPLES}")
+fi
+
+if [ "${USE_BATCHED_UPDATE:-}" = "true" ]; then
+    CMD+=(--use_batched_update)
+elif [ "${USE_BATCHED_UPDATE:-}" = "false" ]; then
+    CMD+=(--no-use_batched_update)
+fi
 
 if [ -n "${RESUME_FROM:-}" ]; then
     CMD+=(--resume_from "${RESUME_FROM}")

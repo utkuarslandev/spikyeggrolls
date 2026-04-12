@@ -67,9 +67,18 @@ def _simple_conv2d_lora_update(base_sigma, param, key, scores, iterinfo, frozen_
 def _noop_update(base_sigma, param, key, scores, iterinfo, frozen_noiser_params):
     return jnp.zeros_like(param)
 
+
+def _centered_ranks(raw_scores):
+    order = jnp.argsort(raw_scores, stable=True)
+    ranks = jnp.empty_like(order, dtype=jnp.float32)
+    ranks = ranks.at[order].set(jnp.arange(raw_scores.shape[0], dtype=jnp.float32))
+    if raw_scores.shape[0] == 1:
+        return jnp.zeros_like(ranks)
+    return ranks / (raw_scores.shape[0] - 1) - 0.5
+
 class EggRoll(Noiser):
     @classmethod
-    def init_noiser(cls, params, sigma, lr, *args, solver=None, solver_kwargs=None, group_size=0, freeze_nonlora=False, noise_reuse=0, rank=1, use_batched_update: bool = False, **kwargs):
+    def init_noiser(cls, params, sigma, lr, *args, solver=None, solver_kwargs=None, group_size=0, freeze_nonlora=False, noise_reuse=0, rank=1, use_batched_update: bool = False, fitness_shaping: str = "zscore", **kwargs):
         """
         Return frozen_noiser_params and noiser_params
         """
@@ -80,7 +89,7 @@ class EggRoll(Noiser):
         true_solver = solver(lr, **solver_kwargs)
         opt_state = true_solver.init(params)
         
-        return {"group_size": group_size, "freeze_nonlora": freeze_nonlora, "noise_reuse": noise_reuse, "solver": true_solver, "rank": rank, "use_batched_update": use_batched_update}, {"sigma": sigma, "opt_state": opt_state}
+        return {"group_size": group_size, "freeze_nonlora": freeze_nonlora, "noise_reuse": noise_reuse, "solver": true_solver, "rank": rank, "use_batched_update": use_batched_update, "fitness_shaping": fitness_shaping}, {"sigma": sigma, "opt_state": opt_state}
     
     @classmethod
     def do_mm(cls, frozen_noiser_params, noiser_params, param, base_key, iterinfo, x):
@@ -126,15 +135,22 @@ class EggRoll(Noiser):
     @classmethod
     def convert_fitnesses(cls, frozen_noiser_params, noiser_params, raw_scores, num_episodes_list=None):
         group_size = frozen_noiser_params["group_size"]
+        shaping = frozen_noiser_params.get("fitness_shaping", "zscore")
         if group_size == 0:
-            true_scores = (raw_scores - jnp.mean(raw_scores, keepdims=True)) / jnp.sqrt(jnp.var(raw_scores, keepdims=True) + 1e-5)
+            grouped_scores = raw_scores[None, :]
         else:
-            group_scores = raw_scores.reshape((-1, group_size))
-            true_scores = (group_scores - jnp.mean(group_scores, axis=-1, keepdims=True)) / jnp.sqrt(jnp.var(group_scores, axis=-1, keepdims=True) + 1e-5)
-            true_scores = true_scores.ravel()
-        # fitness = jax.nn.softmax(true_scores)
-        # return fitness * raw_scores.size
-        return true_scores
+            grouped_scores = raw_scores.reshape((-1, group_size))
+
+        if shaping == "zscore":
+            true_scores = (
+                grouped_scores - jnp.mean(grouped_scores, axis=-1, keepdims=True)
+            ) / jnp.sqrt(jnp.var(grouped_scores, axis=-1, keepdims=True) + 1e-5)
+        elif shaping == "centered_rank":
+            true_scores = jax.vmap(_centered_ranks)(grouped_scores)
+        else:
+            raise ValueError(f"Unsupported fitness_shaping '{shaping}'.")
+
+        return true_scores.ravel() if group_size != 0 else true_scores[0]
 
     @classmethod
     def _do_update(cls, param, base_key, fitnesses, iterinfos, map_classification, sigma, frozen_noiser_params, **kwargs):

@@ -47,8 +47,10 @@ uv pip install -e ".[cuda13]"
 # CIFAR-10 deep scaling smoke (spiking ResNet18-style model)
 .venv/bin/python -m spikyeggroll.train \
   --dataset cifar10 --model_name spiking_resnet18 \
-  --pop_size 256 --rank 2 --sigma 0.01 --lr 0.002 --epochs 3 \
-  --timesteps 8 --batch_size 64 --chunk_size 128
+  --pop_size 4096 --rank 2 --sigma 0.006 --lr 0.0015 --epochs 50 \
+  --timesteps 16 --batch_size 32 --chunk_size 96 --updates_per_epoch 64 \
+  --sigma_max 0.012 --fitness_shaping centered_rank --use_batched_update \
+  --dtype bfloat16 --augment --num_test_eval_samples 1024
 
 # Run tests
 .venv/bin/python -m pytest tests/ -v
@@ -116,14 +118,14 @@ Preset defaults in `scripts/run_train.sh`:
 | full   | 10000    | 3    | 0.007 | 0.001 | 4000 | 256        | 1024       |
 
 For CIFAR-10 deep runs, set `DATASET=cifar10 MODEL_NAME=spiking_resnet18`.
-The launcher also applies CIFAR-friendly defaults when those are selected:
-`TIMESTEPS=8`, `BATCH_SIZE=64`, and `CHUNK_SIZE=128`.
+The launcher now applies the throughput-oriented CIFAR defaults used by the
+current 5090 experiments:
+`TIMESTEPS=16`, `BATCH_SIZE=32`, `CHUNK_SIZE=96`, `UPDATES_PER_EPOCH=64`,
+`FITNESS_SHAPING=centered_rank`, `USE_BATCHED_UPDATE=true`,
+`DTYPE=bfloat16`, `SIGMA_MAX=0.012`, and `NUM_TEST_EVAL_SAMPLES=1024`.
 
-This smaller CIFAR configuration is intentional. The previous `width=768`,
-`blocks=8`, `timesteps=4` default was observed to die at initialization on real
-CIFAR batches, producing zero output activity and zero ES fitness spread. See
-[docs/cifar-experiments-log.md](docs/cifar-experiments-log.md) for the probe
-results and rationale.
+See [docs/cifar-experiments-log.md](docs/cifar-experiments-log.md) for the
+current CIFAR results and failure modes.
 
 Population-scaling sweep example (6 settings, 3 seeds each):
 
@@ -131,7 +133,10 @@ Population-scaling sweep example (6 settings, 3 seeds each):
 for POP in 256 512 1024 2048 4096 8192; do
   for SEED in 0 1 2; do
     DATASET=cifar10 MODEL_NAME=spiking_resnet18 \
-    POP_SIZE=$POP RANK=2 SIGMA=0.01 LR=0.002 EPOCHS=50 TIMESTEPS=4 \
+    POP_SIZE=$POP RANK=2 SIGMA=0.006 LR=0.0015 EPOCHS=50 TIMESTEPS=16 \
+    BATCH_SIZE=32 CHUNK_SIZE=96 UPDATES_PER_EPOCH=64 \
+    FITNESS_SHAPING=centered_rank USE_BATCHED_UPDATE=true \
+    DTYPE=bfloat16 SIGMA_MAX=0.012 NUM_TEST_EVAL_SAMPLES=1024 \
     RUN_NAME="cifar10-resnet18-pop${POP}-s${SEED}" \
     make tune-local -- --seed $SEED
   done

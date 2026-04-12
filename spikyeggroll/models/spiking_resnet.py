@@ -319,7 +319,9 @@ class SpikingResNet18Model(Model):
         return init
 
     @classmethod
-    def _initial_block_states(cls, batch_size: int, image_size: int, stage_channels, stage_blocks):
+    def _initial_block_states(
+        cls, batch_size: int, image_size: int, stage_channels, stage_blocks, dtype=jnp.float32
+    ):
         states = []
         spatial = image_size
         for stage_idx, (out_channels, block_count) in enumerate(zip(stage_channels, stage_blocks)):
@@ -327,7 +329,7 @@ class SpikingResNet18Model(Model):
                 stride = 2 if stage_idx > 0 and block_idx == 0 else 1
                 spatial = _conv_out_dim(spatial, 3, stride, 1)
                 shape = (batch_size, out_channels, spatial, spatial)
-                states.append((jnp.zeros(shape), jnp.zeros(shape), jnp.zeros(shape)))
+                states.append((jnp.zeros(shape, dtype=dtype), jnp.zeros(shape, dtype=dtype), jnp.zeros(shape, dtype=dtype)))
         return tuple(states)
 
     @classmethod
@@ -371,18 +373,20 @@ class SpikingResNet18Model(Model):
                 f"spiking_resnet18 expects input shape [B, T, C, H, W], got {x.shape}."
             )
 
+        model_dtype = common_params.params["stem_conv"]["weight"].dtype
         batch_size, timesteps, _, image_size, _ = x.shape
         stage_channels = common_params.frozen_params["stage_channels"]
         stage_blocks = common_params.frozen_params["stage_blocks"]
-        stem_v = jnp.zeros((batch_size, stage_channels[0], image_size, image_size))
+        stem_v = jnp.zeros((batch_size, stage_channels[0], image_size, image_size), dtype=model_dtype)
         block_states = cls._initial_block_states(
-            batch_size, image_size, stage_channels, stage_blocks
+            batch_size, image_size, stage_channels, stage_blocks, dtype=model_dtype
         )
         classifier_v = jnp.zeros(
-            (batch_size, common_params.params["linear_out"]["weight"].shape[0])
+            (batch_size, common_params.params["linear_out"]["weight"].shape[0]),
+            dtype=model_dtype,
         )
         acc = jnp.zeros_like(classifier_v)
-        x_t = jnp.transpose(x, (1, 0, 2, 3, 4))
+        x_t = jnp.transpose(x.astype(model_dtype), (1, 0, 2, 3, 4))
         (_, _, _, acc), _ = jax.lax.scan(
             lambda carry, step_x: cls._scan_step(common_params, carry, step_x),
             (stem_v, block_states, classifier_v, acc),
@@ -402,14 +406,18 @@ class SpikingResNet18Model(Model):
         use_membrane = common_params.frozen_params["membrane_readout"]
         stage_channels = common_params.frozen_params["stage_channels"]
         stage_blocks = common_params.frozen_params["stage_blocks"]
+        model_dtype = common_params.params["stem_conv"]["weight"].dtype
 
         batch_size, timesteps, _, image_size, _ = x.shape
-        stem_v = jnp.zeros((batch_size, stage_channels[0], image_size, image_size))
+        stem_v = jnp.zeros((batch_size, stage_channels[0], image_size, image_size), dtype=model_dtype)
         block_states = list(
-            cls._initial_block_states(batch_size, image_size, stage_channels, stage_blocks)
+            cls._initial_block_states(
+                batch_size, image_size, stage_channels, stage_blocks, dtype=model_dtype
+            )
         )
         classifier_v = jnp.zeros(
-            (batch_size, common_params.params["linear_out"]["weight"].shape[0])
+            (batch_size, common_params.params["linear_out"]["weight"].shape[0]),
+            dtype=model_dtype,
         )
         acc = jnp.zeros_like(classifier_v)
 
@@ -420,7 +428,7 @@ class SpikingResNet18Model(Model):
         classifier_positive_fraction = []
         classifier_mean = []
 
-        x_t = jnp.transpose(x, (1, 0, 2, 3, 4))
+        x_t = jnp.transpose(x.astype(model_dtype), (1, 0, 2, 3, 4))
         for x_step in x_t:
             x_step = call_submodule(Conv2d, "stem_conv", common_params, x_step)
             x_step = call_submodule(GroupNorm2d, "stem_norm", common_params, x_step)

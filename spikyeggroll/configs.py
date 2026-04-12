@@ -26,12 +26,16 @@ class SNNConfig:
     rank: int = 3
     sigma: float = 0.007
     sigma_min: float = 0.001
+    sigma_max: float = 1.0
     lr: float = 0.005
+    fitness_shaping: str = "zscore"
+    use_batched_update: bool = False
 
     # Training
     batch_size: int = 256
     chunk_size: int = 0
     num_epochs: int = 400
+    updates_per_epoch: int = 1
     seed: int = 0
     log_interval: int = 10
     test_interval: int = 100

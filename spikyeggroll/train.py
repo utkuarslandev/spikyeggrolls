@@ -1,6 +1,7 @@
 """Main training loop using EGGROLL evolution strategies."""
 
 import argparse
+from collections import deque
 import json
 import pickle
 import time
@@ -29,6 +30,14 @@ def _tree_to_jax(tree):
     return jax.tree_util.tree_map(jnp.asarray, tree)
 
 
+def _serialize_key(key):
+    return np.asarray(jax.random.key_data(key))
+
+
+def _deserialize_key(key_data):
+    return jax.random.wrap_key_data(jnp.asarray(key_data))
+
+
 def _checkpoint_path(checkpoint_dir: Path, run_name: str, suffix: str) -> Path:
     return checkpoint_dir / f"{run_name}-{suffix}.pkl"
 
@@ -42,6 +51,8 @@ def save_checkpoint(
     params,
     noiser_params,
     data_key,
+    prefetch_batch_keys,
+    global_update,
     ema_success,
     best_test_acc,
     best_epoch,
@@ -52,7 +63,9 @@ def save_checkpoint(
         "epoch": epoch,
         "params": _tree_to_numpy(params),
         "noiser_params": _tree_to_numpy(noiser_params),
-        "data_key": np.asarray(jax.random.key_data(data_key)),
+        "data_key": _serialize_key(data_key),
+        "prefetch_batch_keys": [_serialize_key(k) for k in prefetch_batch_keys],
+        "global_update": global_update,
         "ema_success": ema_success,
         "best_test_acc": best_test_acc,
         "best_epoch": best_epoch,
@@ -70,7 +83,10 @@ def load_checkpoint(path: str):
         payload = pickle.load(fh)
     payload["params"] = _tree_to_jax(payload["params"])
     payload["noiser_params"] = _tree_to_jax(payload["noiser_params"])
-    payload["data_key"] = jax.random.wrap_key_data(jnp.asarray(payload["data_key"]))
+    payload["data_key"] = _deserialize_key(payload["data_key"])
+    payload["prefetch_batch_keys"] = [
+        _deserialize_key(k) for k in payload.get("prefetch_batch_keys", [])
+    ]
     return payload
 
 
@@ -142,19 +158,25 @@ def train(cfg: SNNConfig = None):
         solver=optax.adamw,
         solver_kwargs={"b1": 0.9, "b2": 0.999},
         rank=cfg.rank,
+        use_batched_update=cfg.use_batched_update,
+        fitness_shaping=cfg.fitness_shaping,
     )
 
     start_epoch = 0
+    global_update = 0
     ema_success = None
     best_test_acc = float("-inf")
     best_epoch = None
+    pending_batch_keys = []
 
     if cfg.resume_from:
         checkpoint = load_checkpoint(cfg.resume_from)
         params = checkpoint["params"]
         noiser_params = checkpoint["noiser_params"]
         data_key = checkpoint["data_key"]
+        pending_batch_keys = checkpoint.get("prefetch_batch_keys", [])
         start_epoch = int(checkpoint["epoch"]) + 1
+        global_update = int(checkpoint.get("global_update", start_epoch))
         ema_success = checkpoint.get("ema_success")
         best_test_acc = float(checkpoint.get("best_test_acc", float("-inf")))
         best_epoch = checkpoint.get("best_epoch")
@@ -165,6 +187,7 @@ def train(cfg: SNNConfig = None):
                 "event": "resume",
                 "resume_from": str(cfg.resume_from),
                 "start_epoch": start_epoch,
+                "global_update": global_update,
                 "timestamp": time.time(),
             },
         )
@@ -188,6 +211,8 @@ def train(cfg: SNNConfig = None):
         )
     _timesteps = cfg.timesteps
     _batch_size = cfg.batch_size
+    _chunk_size = cfg.chunk_size
+    _prefetch_depth = 2
 
     @jax.jit
     def sample_and_encode(images, labels, key):
@@ -211,7 +236,10 @@ def train(cfg: SNNConfig = None):
             f"in_channels={cfg.in_channels} norm={cfg.resnet_norm}:{cfg.resnet_norm_groups} "
             f"classes={cfg.n_classes}"
         )
-    print(f"EGGROLL: pop={N}, rank={cfg.rank}, sigma={cfg.sigma}, lr={cfg.lr}")
+    print(
+        f"EGGROLL: pop={N}, rank={cfg.rank}, sigma={cfg.sigma}, lr={cfg.lr}, "
+        f"shape={cfg.fitness_shaping}, batched_update={cfg.use_batched_update}"
+    )
     print(f"Run: {cfg.run_name} | metrics: {metrics_path} | checkpoints: {checkpoint_dir}")
 
     # Augmentation: only for CIFAR-10, evaluated at Python trace time (JIT-safe constant)
@@ -249,7 +277,8 @@ def train(cfg: SNNConfig = None):
     jit_update = jax.jit(
         lambda n, p, f, i: EggRoll.do_updates(
             frozen_noiser_params, n, p, es_tree_key, f, i, es_map
-        )
+        ),
+        donate_argnums=(0, 1),
     )
 
     # Evaluate test set in fixed-size chunks (same batch size as training).
@@ -259,19 +288,82 @@ def train(cfg: SNNConfig = None):
         eval_test_size = min(eval_test_size, cfg.num_test_eval_samples)
     n_test_chunks = eval_test_size // cfg.batch_size
 
+    if _chunk_size > 0 and _chunk_size < N:
+        _score_pad = (-N) % _chunk_size
+        _padded_size = N + _score_pad
+        _chunk_starts = jnp.arange(0, _padded_size, _chunk_size, dtype=jnp.int32)
+    else:
+        _score_pad = 0
+        _padded_size = N
+        _chunk_starts = None
+
+    @jax.jit
+    def score_population_full(noiser_params, params, iterinfo, x, l1b, y):
+        pop_out = jit_forward(noiser_params, params, iterinfo, x, l1b)
+        return jax.vmap(compute_fitness, in_axes=(0, None))(pop_out, y)
+
+    if _chunk_starts is not None:
+
+        @jax.jit
+        def score_population_chunked(
+            noiser_params, params, epoch_ids, thread_ids, x, l1b, y
+        ):
+            if _score_pad:
+                epoch_ids = jnp.pad(epoch_ids, (0, _score_pad), mode="edge")
+                thread_ids = jnp.pad(thread_ids, (0, _score_pad), mode="edge")
+
+            def score_chunk(start):
+                idx = jnp.arange(_chunk_size, dtype=jnp.int32) + start
+                c_iter = (epoch_ids[idx], thread_ids[idx])
+                return score_population_full(noiser_params, params, c_iter, x, l1b, y)
+
+            return jax.lax.map(score_chunk, _chunk_starts).reshape(-1)[:N]
+
     def eval_test():
         if n_test_chunks == 0:
             return float("nan")
-        all_preds = []
-        for i in range(n_test_chunks):
-            start = i * cfg.batch_size
-            te_chunk = test_data[start:start+cfg.batch_size]
-            te_key = jax.random.fold_in(jax.random.key(999), i)
-            te_spikes = encode_batch_fn(te_chunk, cfg.timesteps, te_key)
-            out = jit_forward_eval(noiser_params, params, te_spikes)
-            all_preds.append(jnp.argmax(out, axis=-1))
-        end = n_test_chunks * cfg.batch_size
-        return float(jnp.mean(jnp.concatenate(all_preds) == test_labels[:end]))
+
+        eval_inputs = test_data[: n_test_chunks * cfg.batch_size]
+        eval_labels = test_labels[: n_test_chunks * cfg.batch_size]
+
+        @jax.jit
+        def eval_batches(noiser_params, params, images, labels):
+            def eval_one(i):
+                start = i * cfg.batch_size
+                te_chunk = jax.lax.dynamic_slice_in_dim(images, start, cfg.batch_size, axis=0)
+                te_key = jax.random.fold_in(jax.random.key(999), i)
+                te_spikes = encode_batch_fn(te_chunk, cfg.timesteps, te_key)
+                out = jit_forward_eval(noiser_params, params, te_spikes)
+                return jnp.argmax(out, axis=-1)
+
+            preds = jax.lax.map(eval_one, jnp.arange(n_test_chunks, dtype=jnp.int32)).reshape(-1)
+            return jnp.mean(preds == labels)
+
+        return float(eval_batches(noiser_params, params, eval_inputs, eval_labels))
+
+    def build_prefetch_queue(start_key, queued_keys=None):
+        queue = deque()
+        next_key = start_key
+        batch_keys = list(queued_keys or [])
+
+        while len(batch_keys) < _prefetch_depth:
+            next_key, batch_key = jax.random.split(next_key)
+            batch_keys.append(batch_key)
+
+        for batch_key in batch_keys:
+            x_batch, y_batch = sample_and_encode(train_data, train_labels, batch_key)
+            queue.append((batch_key, x_batch, y_batch))
+
+        return queue, next_key
+
+    def pop_prefetched_batch(queue, next_key):
+        _, x_batch, y_batch = queue.popleft()
+        next_key, batch_key = jax.random.split(next_key)
+        next_x, next_y = sample_and_encode(train_data, train_labels, batch_key)
+        queue.append((batch_key, next_x, next_y))
+        return x_batch, y_batch, queue, next_key
+
+    prefetch_queue, data_key = build_prefetch_queue(data_key, pending_batch_keys)
 
     write_metric(
         metrics_path,
@@ -281,6 +373,7 @@ def train(cfg: SNNConfig = None):
             "cfg": asdict(cfg),
             "timestamp": time.time(),
             "start_epoch": start_epoch,
+            "global_update": global_update,
         },
     )
 
@@ -289,62 +382,71 @@ def train(cfg: SNNConfig = None):
     last_completed_epoch = start_epoch - 1
     try:
         for epoch in range(start_epoch, cfg.num_epochs):
-            data_key, batch_key, _encode_key = jax.random.split(data_key, 3)
+            for _ in range(cfg.updates_per_epoch):
+                x_batch, y_batch, prefetch_queue, data_key = pop_prefetched_batch(
+                    prefetch_queue, data_key
+                )
 
-            # Sample mini-batch with Poisson encoding (same for all population members)
-            x_batch, y_batch = sample_and_encode(train_data, train_labels, batch_key)
+                # Build iterinfo for population
+                iterinfo = (
+                    jnp.full(N, global_update, dtype=jnp.int32),
+                    jnp.arange(N),
+                )
 
-            # Build iterinfo for population
-            iterinfo = (jnp.full(N, epoch, dtype=jnp.int32), jnp.arange(N))
+                # Evaluate base params (no noise) on this batch
+                val_out = jit_forward_eval(noiser_params, params, x_batch)
+                val_fitness = compute_fitness(val_out, y_batch)
 
-            # Evaluate base params (no noise) on this batch
-            val_out = jit_forward_eval(noiser_params, params, x_batch)
-            val_fitness = compute_fitness(val_out, y_batch)
+                # Precompute layer 1 base matmul when model exposes linear1
+                l1_base = None
+                if "linear1" in params:
+                    l1_base = compute_l1_base(params, x_batch)
 
-            # Precompute layer 1 base matmul when model exposes linear1
-            l1_base = None
-            if "linear1" in params:
-                l1_base = compute_l1_base(params, x_batch)
+                # Evaluate population (with noise)
+                if _chunk_starts is not None:
+                    raw_scores = score_population_chunked(
+                        noiser_params,
+                        params,
+                        iterinfo[0],
+                        iterinfo[1],
+                        x_batch,
+                        l1_base,
+                        y_batch,
+                    )
+                else:
+                    raw_scores = score_population_full(
+                        noiser_params, params, iterinfo, x_batch, l1_base, y_batch
+                    )
 
-            # Evaluate population (with noise) — chunked to fit in GPU memory
-            if cfg.chunk_size > 0 and cfg.chunk_size < N:
-                score_chunks = []
-                for c_start in range(0, N, cfg.chunk_size):
-                    c_end = min(c_start + cfg.chunk_size, N)
-                    c_iter = (iterinfo[0][c_start:c_end], iterinfo[1][c_start:c_end])
-                    c_out = jit_forward(noiser_params, params, c_iter, x_batch, l1_base)
-                    c_scores = jax.vmap(compute_fitness, in_axes=(0, None))(c_out, y_batch)
-                    score_chunks.append(c_scores)
-                raw_scores = jnp.concatenate(score_chunks)
-            else:
-                pop_out = jit_forward(noiser_params, params, iterinfo, x_batch, l1_base)
-                raw_scores = jax.vmap(compute_fitness, in_axes=(0, None))(pop_out, y_batch)
+                fitnesses = EggRoll.convert_fitnesses(
+                    frozen_noiser_params, noiser_params, raw_scores
+                )
+                raw_score_std = float(jnp.std(raw_scores))
 
-            # Z-score fitness shaping
-            fitnesses = EggRoll.convert_fitnesses(
-                frozen_noiser_params, noiser_params, raw_scores
-            )
-            raw_score_std = float(jnp.std(raw_scores))
+                # Update parameters
+                noiser_params, params = jit_update(
+                    noiser_params, params, fitnesses, iterinfo
+                )
 
-            # Update parameters
-            noiser_params, params = jit_update(noiser_params, params, fitnesses, iterinfo)
+                # 1/5th success rule: adapt sigma based on fraction beating baseline
+                n_better = int(jnp.sum(raw_scores > val_fitness))
+                success_rate = n_better / N
 
-            # 1/5th success rule: adapt sigma based on fraction beating baseline
-            n_better = int(jnp.sum(raw_scores > val_fitness))
-            success_rate = n_better / N
+                if ema_success is None:
+                    ema_success = success_rate
+                else:
+                    ema_success = 0.9 * ema_success + 0.1 * success_rate
 
-            if ema_success is None:
-                ema_success = success_rate
-            else:
-                ema_success = 0.9 * ema_success + 0.1 * success_rate
+                if global_update >= cfg.sigma_warmup_epochs * cfg.updates_per_epoch:
+                    if ema_success > 0.2:
+                        noiser_params["sigma"] = noiser_params["sigma"] * 1.02
+                    elif ema_success < 0.2:
+                        noiser_params["sigma"] = noiser_params["sigma"] / 1.02
 
-            if epoch >= cfg.sigma_warmup_epochs:
-                if ema_success > 0.2:
-                    noiser_params["sigma"] = noiser_params["sigma"] * 1.02
-                elif ema_success < 0.2:
-                    noiser_params["sigma"] = noiser_params["sigma"] / 1.02
-
-            noiser_params["sigma"] = jnp.maximum(noiser_params["sigma"], cfg.sigma_min)
+                noiser_params["sigma"] = jnp.clip(
+                    noiser_params["sigma"], cfg.sigma_min, cfg.sigma_max
+                )
+                global_update += 1
 
             do_log = cfg.log_interval > 0 and epoch % cfg.log_interval == 0
             do_test = cfg.test_interval > 0 and epoch % cfg.test_interval == 0
@@ -354,13 +456,20 @@ def train(cfg: SNNConfig = None):
             output_activity = summarize_output_activity(val_out)
             elapsed = time.time() - t_start
             eps = (epoch - start_epoch + 1) / elapsed if elapsed > 0 else 0.0
+            updates_per_s = global_update / elapsed if elapsed > 0 and global_update > 0 else 0.0
+            avg_update_s = elapsed / global_update if global_update > 0 else 0.0
+            avg_epoch_s = elapsed / (epoch - start_epoch + 1) if epoch >= start_epoch else 0.0
             test_acc = eval_test() if do_test else None
 
             record = {
                 "event": "epoch",
                 "epoch": epoch,
+                "global_update": global_update,
                 "elapsed_s": elapsed,
                 "epochs_per_s": eps,
+                "updates_per_s": updates_per_s,
+                "avg_update_s": avg_update_s,
+                "avg_epoch_s": avg_epoch_s,
                 "val_fitness": float(val_fitness),
                 "val_acc": val_acc,
                 "sigma": float(noiser_params["sigma"]),
@@ -387,6 +496,8 @@ def train(cfg: SNNConfig = None):
                     params,
                     noiser_params,
                     data_key,
+                    [item[0] for item in prefetch_queue],
+                    global_update,
                     ema_success,
                     best_test_acc,
                     best_epoch,
@@ -403,6 +514,8 @@ def train(cfg: SNNConfig = None):
                     params,
                     noiser_params,
                     data_key,
+                    [item[0] for item in prefetch_queue],
+                    global_update,
                     ema_success,
                     best_test_acc,
                     best_epoch,
@@ -414,11 +527,11 @@ def train(cfg: SNNConfig = None):
                 print(
                     f"Epoch {epoch:4d}/{cfg.num_epochs} | "
                     f"fitness: {float(val_fitness):.4f} | "
-                    f"acc: {val_acc:.4f} | "
-                    f"σ: {float(noiser_params['sigma']):.5f} | "
-                    f"better: {n_better:4d}/{N} std:{raw_score_std:.5f} ema:{float(ema_success):.3f} | "
-                    f"{eps:.1f} ep/s"
-                    f"{test_str}"
+                        f"acc: {val_acc:.4f} | "
+                        f"σ: {float(noiser_params['sigma']):.5f} | "
+                        f"better: {n_better:4d}/{N} std:{raw_score_std:.5f} ema:{float(ema_success):.3f} | "
+                        f"{eps:.1f} ep/s {updates_per_s:.2f} upd/s"
+                        f"{test_str}"
                 )
             last_completed_epoch = epoch
     except KeyboardInterrupt:
@@ -431,6 +544,8 @@ def train(cfg: SNNConfig = None):
             params,
             noiser_params,
             data_key,
+            [item[0] for item in prefetch_queue],
+            global_update,
             ema_success,
             best_test_acc,
             best_epoch,
@@ -451,6 +566,8 @@ def train(cfg: SNNConfig = None):
         params,
         noiser_params,
         data_key,
+        [item[0] for item in prefetch_queue],
+        global_update,
         ema_success,
         best_test_acc,
         best_epoch,
@@ -463,6 +580,7 @@ def train(cfg: SNNConfig = None):
         "best_epoch": best_epoch,
         "elapsed_s": elapsed,
         "completed_epochs": last_completed_epoch + 1,
+        "completed_updates": global_update,
         "timestamp": time.time(),
     }
     summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -489,10 +607,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rank", type=int, default=None)
     parser.add_argument("--sigma", type=float, default=None)
     parser.add_argument("--sigma_min", type=float, default=None)
+    parser.add_argument("--sigma_max", type=float, default=None)
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--fitness_shaping", type=str, default=None, choices=["zscore", "centered_rank"])
+    parser.add_argument(
+        "--use_batched_update",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use batched EGGROLL parameter updates",
+    )
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--chunk_size", type=int, default=None, help="Chunk population eval (0=no chunking)")
     parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--updates_per_epoch", type=int, default=None)
     parser.add_argument("--timesteps", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--threshold", type=float, default=None)
@@ -501,6 +628,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--escape_beta", type=float, default=None)
     parser.add_argument("--escape_lambda0", type=float, default=None)
     parser.add_argument("--data_path", type=str, default=None)
+    parser.add_argument("--dtype", type=str, default=None, choices=["float32", "bfloat16"])
     parser.add_argument("--in_channels", type=int, default=None)
     parser.add_argument("--image_size", type=int, default=None)
     parser.add_argument("--augment", action="store_true")
@@ -519,6 +647,8 @@ def build_parser() -> argparse.ArgumentParser:
 def build_config_from_args(args) -> SNNConfig:
     base_cfg = SNNConfig()
     dataset = args.dataset or base_cfg.dataset
+    model_name = args.model_name or base_cfg.model_name
+    is_cifar_resnet = dataset == "cifar10" and model_name == "spiking_resnet18"
 
     dataset_defaults = {
         "mnist": {"n_inputs": 784, "in_channels": 1, "image_size": 28},
@@ -529,7 +659,7 @@ def build_config_from_args(args) -> SNNConfig:
     # Precedence: explicit CLI value > dataset-derived default > SNNConfig default.
     return SNNConfig(
         dataset=dataset,
-        model_name=args.model_name or base_cfg.model_name,
+        model_name=model_name,
         n_inputs=args.N if args.N is not None else dflt["n_inputs"],
         hidden_size=args.hidden_size if args.hidden_size is not None else base_cfg.hidden_size,
         resnet_channels_base=(
@@ -551,9 +681,29 @@ def build_config_from_args(args) -> SNNConfig:
         rank=args.rank if args.rank is not None else base_cfg.rank,
         sigma=args.sigma if args.sigma is not None else base_cfg.sigma,
         sigma_min=args.sigma_min if args.sigma_min is not None else base_cfg.sigma_min,
+        sigma_max=(
+            args.sigma_max
+            if args.sigma_max is not None
+            else (0.012 if is_cifar_resnet else base_cfg.sigma_max)
+        ),
         lr=args.lr if args.lr is not None else base_cfg.lr,
+        fitness_shaping=(
+            args.fitness_shaping
+            if args.fitness_shaping is not None
+            else ("centered_rank" if is_cifar_resnet else base_cfg.fitness_shaping)
+        ),
+        use_batched_update=(
+            args.use_batched_update
+            if args.use_batched_update is not None
+            else (True if is_cifar_resnet else base_cfg.use_batched_update)
+        ),
         batch_size=args.batch_size if args.batch_size is not None else base_cfg.batch_size,
         num_epochs=args.epochs if args.epochs is not None else base_cfg.num_epochs,
+        updates_per_epoch=(
+            args.updates_per_epoch
+            if args.updates_per_epoch is not None
+            else base_cfg.updates_per_epoch
+        ),
         chunk_size=args.chunk_size if args.chunk_size is not None else base_cfg.chunk_size,
         threshold=args.threshold if args.threshold is not None else base_cfg.threshold,
         membrane_readout=args.membrane_readout,
@@ -562,6 +712,7 @@ def build_config_from_args(args) -> SNNConfig:
         escape_lambda0=args.escape_lambda0 if args.escape_lambda0 is not None else base_cfg.escape_lambda0,
         seed=args.seed if args.seed is not None else base_cfg.seed,
         data_path=args.data_path or base_cfg.data_path,
+        dtype=args.dtype or base_cfg.dtype,
         in_channels=args.in_channels if args.in_channels is not None else dflt["in_channels"],
         image_size=args.image_size if args.image_size is not None else dflt["image_size"],
         augment=args.augment,
