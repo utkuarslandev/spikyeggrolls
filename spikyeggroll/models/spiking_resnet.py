@@ -61,7 +61,11 @@ def _merge_bn_stats(existing, incoming):
     return merged
 
 
-def _mean_bn_stats(stats_tree):
+def _reduce_bn_stats(stats_tree, norm_kind: str):
+    if stats_tree is None:
+        return None
+    if norm_kind == "bntt":
+        return stats_tree
     return jax.tree_util.tree_map(lambda x: jnp.mean(x, axis=0), stats_tree)
 
 
@@ -96,6 +100,8 @@ class Conv2d(Model):
         padding: int,
         use_bias: bool,
         dtype,
+        cfg: SNNConfig | None = None,
+        conv_es_mode: str | None = None,
     ):
         k1, k2 = jax.random.split(key)
         init = merge_inits(
@@ -113,14 +119,38 @@ class Conv2d(Model):
                 {**init.scan_map, "bias": bias_init.scan_map},
                 {**init.es_map, "bias": bias_init.es_map},
             )
-        return merge_frozen(init, stride=stride, padding=padding)
+        return merge_frozen(
+            init,
+            stride=stride,
+            padding=padding,
+            conv_es_mode=conv_es_mode
+            if conv_es_mode is not None
+            else (cfg.conv_es_mode if cfg is not None else "kernel_lora"),
+        )
 
     @classmethod
     def _forward(cls, common_params: CommonParams, x):
         stride = int(common_params.frozen_params["stride"])
         padding = int(common_params.frozen_params["padding"])
-        weight = call_submodule(ConvKernel, "weight", common_params)
-        out = _conv2d_nchw(x, weight, stride=stride, padding=padding)
+        conv_es_mode = common_params.frozen_params.get("conv_es_mode", "kernel_lora")
+        if common_params.iterinfo is None:
+            out = _conv2d_nchw(
+                x, common_params.params["weight"], stride=stride, padding=padding
+            )
+        elif conv_es_mode == "matrix_lora":
+            out = common_params.noiser.do_conv2d_matrix_lora(
+                common_params.frozen_noiser_params,
+                common_params.noiser_params,
+                common_params.params["weight"],
+                common_params.es_tree_key["weight"],
+                common_params.iterinfo,
+                x,
+                stride=stride,
+                padding=padding,
+            )
+        else:
+            weight = call_submodule(ConvKernel, "weight", common_params)
+            out = _conv2d_nchw(x, weight, stride=stride, padding=padding)
         if "bias" in common_params.params:
             bias = call_submodule(Parameter, "bias", common_params)
             out = out + bias[None, :, None, None]
@@ -223,6 +253,94 @@ class BatchNorm2d(Model):
         return out
 
 
+class BNTTNorm2d(Model):
+    @classmethod
+    def rand_init(
+        cls,
+        key,
+        channels: int,
+        timesteps: int,
+        dtype,
+        momentum: float = 0.9,
+        eps: float = 1e-5,
+        affine_bias: bool = False,
+    ):
+        k1, k2 = jax.random.split(key)
+        weight = jnp.ones((timesteps, channels), dtype=dtype)
+        bias = (
+            jnp.zeros((timesteps, channels), dtype=dtype)
+            if affine_bias
+            else None
+        )
+        return CommonInit(
+            {
+                "momentum": momentum,
+                "eps": eps,
+                "affine_bias": affine_bias,
+            },
+            {
+                "weight": weight,
+                **({"bias": bias} if bias is not None else {}),
+                "running_mean": jnp.zeros((timesteps, channels), dtype=dtype),
+                "running_var": jnp.ones((timesteps, channels), dtype=dtype),
+            },
+            {
+                "weight": (),
+                **({"bias": ()} if bias is not None else {}),
+                "running_mean": (),
+                "running_var": (),
+            },
+            {
+                "weight": 0,
+                **({"bias": 0} if bias is not None else {}),
+                "running_mean": EXCLUDED,
+                "running_var": EXCLUDED,
+            },
+        )
+
+    @classmethod
+    def _forward(
+        cls,
+        common_params: CommonParams,
+        x,
+        *,
+        timestep_idx,
+        norm_training: bool = False,
+        collect_bn_stats: bool = False,
+    ):
+        eps = common_params.frozen_params["eps"]
+        weight = jax.lax.dynamic_index_in_dim(
+            common_params.params["weight"], timestep_idx, axis=0, keepdims=False
+        )[None, :, None, None]
+        if "bias" in common_params.params:
+            bias = jax.lax.dynamic_index_in_dim(
+                common_params.params["bias"], timestep_idx, axis=0, keepdims=False
+            )[None, :, None, None]
+        else:
+            bias = 0.0
+        if norm_training:
+            mean = jnp.mean(x, axis=(0, 2, 3))
+            var = jnp.var(x, axis=(0, 2, 3))
+        else:
+            mean = jax.lax.dynamic_index_in_dim(
+                common_params.params["running_mean"],
+                timestep_idx,
+                axis=0,
+                keepdims=False,
+            )
+            var = jax.lax.dynamic_index_in_dim(
+                common_params.params["running_var"],
+                timestep_idx,
+                axis=0,
+                keepdims=False,
+            )
+        normed = (x - mean[None, :, None, None]) / jnp.sqrt(var[None, :, None, None] + eps)
+        out = normed * weight + bias
+        if collect_bn_stats:
+            return out, {"mean": mean, "var": var}
+        return out
+
+
 def _norm_rand_init(key, channels: int, cfg: SNNConfig):
     if cfg.resnet_norm == "group":
         return GroupNorm2d.rand_init(key, channels, cfg.dtype, cfg.resnet_norm_groups)
@@ -234,6 +352,16 @@ def _norm_rand_init(key, channels: int, cfg: SNNConfig):
             momentum=cfg.resnet_bn_momentum,
             eps=cfg.resnet_bn_eps,
         )
+    if cfg.resnet_norm == "bntt":
+        return BNTTNorm2d.rand_init(
+            key,
+            channels,
+            cfg.timesteps,
+            cfg.dtype,
+            momentum=cfg.resnet_bntt_momentum,
+            eps=cfg.resnet_bntt_eps,
+            affine_bias=cfg.resnet_bntt_affine_bias,
+        )
     raise ValueError(f"Unsupported resnet_norm='{cfg.resnet_norm}'.")
 
 
@@ -242,13 +370,14 @@ def _apply_norm(
     name: str,
     x,
     *,
+    timestep_idx=None,
     norm_training: bool,
     collect_bn_stats: bool,
 ):
     norm_kind = common_params.frozen_params["resnet_norm"]
     if norm_kind == "group":
         return call_submodule(GroupNorm2d, name, common_params, x), None
-    if collect_bn_stats:
+    if norm_kind == "batch" and collect_bn_stats:
         return call_submodule(
             BatchNorm2d,
             name,
@@ -257,11 +386,30 @@ def _apply_norm(
             norm_training=norm_training,
             collect_bn_stats=True,
         )
+    if norm_kind == "batch":
+        return call_submodule(
+            BatchNorm2d,
+            name,
+            common_params,
+            x,
+            norm_training=norm_training,
+        ), None
+    if collect_bn_stats:
+        return call_submodule(
+            BNTTNorm2d,
+            name,
+            common_params,
+            x,
+            timestep_idx=timestep_idx,
+            norm_training=norm_training,
+            collect_bn_stats=True,
+        )
     return call_submodule(
-        BatchNorm2d,
+        BNTTNorm2d,
         name,
         common_params,
         x,
+        timestep_idx=timestep_idx,
         norm_training=norm_training,
     ), None
 
@@ -287,6 +435,7 @@ class ProjectionShortcut(Model):
                 padding=0,
                 use_bias=False,
                 dtype=cfg.dtype,
+                cfg=cfg,
             ),
             norm=_norm_rand_init(k2, out_channels, cfg),
         )
@@ -298,6 +447,7 @@ class ProjectionShortcut(Model):
         common_params: CommonParams,
         x,
         *,
+        timestep_idx=None,
         norm_training: bool = False,
         collect_bn_stats: bool = False,
     ):
@@ -306,6 +456,7 @@ class ProjectionShortcut(Model):
             common_params,
             "norm",
             x,
+            timestep_idx=timestep_idx,
             norm_training=norm_training,
             collect_bn_stats=collect_bn_stats,
         )
@@ -336,6 +487,7 @@ class BasicBlock(Model):
                 padding=1,
                 use_bias=False,
                 dtype=cfg.dtype,
+                cfg=cfg,
             ),
             norm1=_norm_rand_init(k2, out_channels, cfg),
             conv2=Conv2d.rand_init(
@@ -347,6 +499,7 @@ class BasicBlock(Model):
                 padding=1,
                 use_bias=False,
                 dtype=cfg.dtype,
+                cfg=cfg,
             ),
             norm2=_norm_rand_init(k4, out_channels, cfg),
         )
@@ -386,6 +539,7 @@ class BasicBlock(Model):
         x,
         state,
         collect_stats: bool = False,
+        timestep_idx=None,
         norm_training: bool = False,
         collect_bn_stats: bool = False,
     ):
@@ -398,6 +552,7 @@ class BasicBlock(Model):
             common_params,
             "norm1",
             out,
+            timestep_idx=timestep_idx,
             norm_training=norm_training,
             collect_bn_stats=collect_bn_stats,
         )
@@ -408,6 +563,7 @@ class BasicBlock(Model):
             common_params,
             "norm2",
             out,
+            timestep_idx=timestep_idx,
             norm_training=norm_training,
             collect_bn_stats=collect_bn_stats,
         )
@@ -421,6 +577,7 @@ class BasicBlock(Model):
                 "shortcut",
                 common_params,
                 x,
+                timestep_idx=timestep_idx,
                 norm_training=norm_training,
                 collect_bn_stats=collect_bn_stats,
             )
@@ -472,9 +629,9 @@ class SpikingResNet18Model(Model):
                 "spiking_resnet18 expects CIFAR-10 config defaults: "
                 "in_channels=3, image_size=32, n_inputs=3072."
             )
-        if cfg.resnet_norm not in {"group", "batch"}:
+        if cfg.resnet_norm not in {"group", "batch", "bntt"}:
             raise ValueError(
-                "spiking_resnet18 supports resnet_norm in {'group', 'batch'}."
+                "spiking_resnet18 supports resnet_norm in {'group', 'batch', 'bntt'}."
             )
         if len(cfg.resnet_block_counts) != len(cls.STAGE_BLOCKS):
             raise ValueError(
@@ -500,6 +657,7 @@ class SpikingResNet18Model(Model):
                 padding=1,
                 use_bias=False,
                 dtype=dtype,
+                cfg=cfg,
             ),
             "stem_norm": _norm_rand_init(keys[1], base_channels, cfg),
             "linear_out": Linear.rand_init(
@@ -554,6 +712,10 @@ class SpikingResNet18Model(Model):
             resnet_norm_groups=cfg.resnet_norm_groups,
             resnet_bn_momentum=cfg.resnet_bn_momentum,
             resnet_bn_eps=cfg.resnet_bn_eps,
+            resnet_bntt_momentum=cfg.resnet_bntt_momentum,
+            resnet_bntt_eps=cfg.resnet_bntt_eps,
+            resnet_bntt_affine_bias=cfg.resnet_bntt_affine_bias,
+            conv_es_mode=cfg.conv_es_mode,
             resnet_threshold_scale=cfg.resnet_threshold_scale,
             perturb_group_map=perturb_group_map,
         )
@@ -656,6 +818,7 @@ class SpikingResNet18Model(Model):
         *,
         stage_start: int,
         stage_end: int,
+        timestep_idx=None,
         norm_training: bool,
         collect_bn_stats: bool = False,
     ):
@@ -673,6 +836,7 @@ class SpikingResNet18Model(Model):
                     common_params,
                     x,
                     block_states[state_idx],
+                    timestep_idx=timestep_idx,
                     norm_training=norm_training,
                     collect_bn_stats=collect_bn_stats,
                 )
@@ -710,7 +874,7 @@ class SpikingResNet18Model(Model):
         cls,
         common_params: CommonParams,
         carry,
-        x_t,
+        step_inputs,
         *,
         norm_training: bool,
         collect_bn_stats: bool,
@@ -721,12 +885,14 @@ class SpikingResNet18Model(Model):
         stage_blocks = common_params.frozen_params["stage_blocks"]
 
         stem_v, block_states, classifier_v, acc = carry
+        timestep_idx, x_t = step_inputs
 
         x = call_submodule(Conv2d, "stem_conv", common_params, x_t)
         x, stem_bn_stats = _apply_norm(
             common_params,
             "stem_norm",
             x,
+            timestep_idx=timestep_idx,
             norm_training=norm_training,
             collect_bn_stats=collect_bn_stats,
         )
@@ -738,6 +904,7 @@ class SpikingResNet18Model(Model):
                 block_states,
                 stage_start=0,
                 stage_end=len(stage_blocks) - 1,
+                timestep_idx=timestep_idx,
                 norm_training=norm_training,
                 collect_bn_stats=True,
             )
@@ -748,6 +915,7 @@ class SpikingResNet18Model(Model):
                 block_states,
                 stage_start=0,
                 stage_end=len(stage_blocks) - 1,
+                timestep_idx=timestep_idx,
                 norm_training=norm_training,
                 collect_bn_stats=False,
             )
@@ -766,7 +934,7 @@ class SpikingResNet18Model(Model):
         cls,
         common_params: CommonParams,
         carry,
-        x_t,
+        step_inputs,
         *,
         prefix_end_stage: int,
         norm_training: bool,
@@ -774,12 +942,14 @@ class SpikingResNet18Model(Model):
         beta = common_params.frozen_params["beta"]
         threshold = common_params.frozen_params["threshold"]
         stem_v, prefix_block_states = carry
+        timestep_idx, x_t = step_inputs
 
         x = call_submodule(Conv2d, "stem_conv", common_params, x_t)
         x, _ = _apply_norm(
             common_params,
             "stem_norm",
             x,
+            timestep_idx=timestep_idx,
             norm_training=norm_training,
             collect_bn_stats=False,
         )
@@ -790,6 +960,7 @@ class SpikingResNet18Model(Model):
             prefix_block_states,
             stage_start=0,
             stage_end=prefix_end_stage,
+            timestep_idx=timestep_idx,
             norm_training=norm_training,
             collect_bn_stats=False,
         )
@@ -800,7 +971,7 @@ class SpikingResNet18Model(Model):
         cls,
         common_params: CommonParams,
         carry,
-        x_t,
+        step_inputs,
         *,
         suffix_start_stage: int,
         norm_training: bool,
@@ -808,12 +979,14 @@ class SpikingResNet18Model(Model):
         beta = common_params.frozen_params["beta"]
         use_membrane = common_params.frozen_params["membrane_readout"]
         suffix_block_states, classifier_v, acc = carry
+        timestep_idx, x_t = step_inputs
         x, suffix_block_states = cls._run_stage_range(
             common_params,
             x_t,
             suffix_block_states,
             stage_start=suffix_start_stage,
             stage_end=len(common_params.frozen_params["stage_blocks"]) - 1,
+            timestep_idx=timestep_idx,
             norm_training=norm_training,
             collect_bn_stats=False,
         )
@@ -855,20 +1028,23 @@ class SpikingResNet18Model(Model):
         )
         acc = jnp.zeros_like(classifier_v)
         x_t = jnp.transpose(x.astype(model_dtype), (1, 0, 2, 3, 4))
+        timestep_idx = jnp.arange(timesteps, dtype=jnp.int32)
         (carry, step_stats) = jax.lax.scan(
-            lambda current_carry, step_x: cls._scan_step(
+            lambda current_carry, step_input: cls._scan_step(
                 common_params,
                 current_carry,
-                step_x,
+                step_input,
                 norm_training=norm_training,
                 collect_bn_stats=collect_bn_stats,
             ),
             (stem_v, block_states, classifier_v, acc),
-            x_t,
+            (timestep_idx, x_t),
         )
         acc = carry[3] / timesteps
         if collect_bn_stats:
-            return acc, _mean_bn_stats(step_stats)
+            return acc, _reduce_bn_stats(
+                step_stats, common_params.frozen_params["resnet_norm"]
+            )
         return acc
 
     @classmethod
@@ -901,16 +1077,17 @@ class SpikingResNet18Model(Model):
             dtype=model_dtype,
         )
         x_t = jnp.transpose(x.astype(model_dtype), (1, 0, 2, 3, 4))
+        timestep_idx = jnp.arange(timesteps, dtype=jnp.int32)
         (_, _), prefix_steps = jax.lax.scan(
-            lambda carry, step_x: cls._prefix_scan_step(
+            lambda carry, step_input: cls._prefix_scan_step(
                 common_params,
                 carry,
-                step_x,
+                step_input,
                 prefix_end_stage=prefix_end_stage,
                 norm_training=norm_training,
             ),
             (stem_v, prefix_block_states),
-            x_t,
+            (timestep_idx, x_t),
         )
         return jnp.transpose(prefix_steps, (1, 0, 2, 3, 4))
 
@@ -946,16 +1123,17 @@ class SpikingResNet18Model(Model):
         )
         acc = jnp.zeros_like(classifier_v)
         cached_t = jnp.transpose(cached_x.astype(model_dtype), (1, 0, 2, 3, 4))
+        timestep_idx = jnp.arange(timesteps, dtype=jnp.int32)
         (_, _, acc), _ = jax.lax.scan(
-            lambda carry, step_x: cls._suffix_scan_step(
+            lambda carry, step_input: cls._suffix_scan_step(
                 common_params,
                 carry,
-                step_x,
+                step_input,
                 suffix_start_stage=suffix_start_stage,
                 norm_training=norm_training,
             ),
             (suffix_block_states, classifier_v, acc),
-            cached_t,
+            (timestep_idx, cached_t),
         )
         return acc / timesteps
 
@@ -1143,12 +1321,13 @@ class SpikingResNet18Model(Model):
         classifier_mean = []
 
         x_t = jnp.transpose(x.astype(model_dtype), (1, 0, 2, 3, 4))
-        for x_step in x_t:
+        for timestep_idx, x_step in enumerate(x_t):
             x_step = call_submodule(Conv2d, "stem_conv", common_params, x_step)
             x_step, _ = _apply_norm(
                 common_params,
                 "stem_norm",
                 x_step,
+                timestep_idx=jnp.int32(timestep_idx),
                 norm_training=norm_training,
                 collect_bn_stats=False,
             )
@@ -1166,6 +1345,7 @@ class SpikingResNet18Model(Model):
                         x_step,
                         block_states[state_idx],
                         True,
+                        timestep_idx=jnp.int32(timestep_idx),
                         norm_training=norm_training,
                         collect_bn_stats=False,
                     )

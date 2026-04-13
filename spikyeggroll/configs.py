@@ -75,6 +75,10 @@ class SNNConfig:
     resnet_norm_groups: int = 8
     resnet_bn_momentum: float = 0.9
     resnet_bn_eps: float = 1e-5
+    resnet_bntt_momentum: float = 0.9
+    resnet_bntt_eps: float = 1e-5
+    resnet_bntt_affine_bias: bool = False
+    conv_es_mode: str = "kernel_lora"
     resnet_threshold_scale: bool = False  # if True, stage i uses threshold * 2**i
     selective_stage_perturbation: bool = False
     stage_perturbation_schedule: str = "head_last_then_last2"

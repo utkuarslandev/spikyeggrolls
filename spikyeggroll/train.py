@@ -616,6 +616,7 @@ def train(cfg: SNNConfig = None):
             f"stages={list(cfg.resnet_block_counts)} "
             f"channels={[cfg.resnet_channels_base * (2 ** i) for i in range(4)]} "
             f"in_channels={cfg.in_channels} norm={cfg.resnet_norm}:{cfg.resnet_norm_groups} "
+            f"conv_es={cfg.conv_es_mode} "
             f"classes={cfg.n_classes}"
         )
     print(
@@ -662,11 +663,11 @@ def train(cfg: SNNConfig = None):
         W1 = params["linear1"]["weight"]     # [hidden, n_inputs]
         return x_t @ W1.T                    # [T, B, hidden]
 
-    use_resnet_batch_norm = (
-        cfg.model_name == "spiking_resnet18" and cfg.resnet_norm == "batch"
+    use_resnet_running_stats_norm = (
+        cfg.model_name == "spiking_resnet18" and cfg.resnet_norm in {"batch", "bntt"}
     )
 
-    if use_resnet_batch_norm:
+    if use_resnet_running_stats_norm:
         jit_forward = jax.jit(
             jax.vmap(
                 lambda n, p, i, x, l1b: model_cls.forward(
@@ -1113,7 +1114,7 @@ def train(cfg: SNNConfig = None):
 
                 # Evaluate base params (no noise) on this batch
                 profiler.log_startup("jit_forward_eval begin", epoch=epoch, global_update=global_update)
-                if use_resnet_batch_norm:
+                if use_resnet_running_stats_norm:
                     (val_out, bn_stats), forward_eval_s = profiler.stage_timed_call(
                         "forward_eval_s",
                         lambda: jit_forward_train_with_bn_stats(
@@ -1123,7 +1124,11 @@ def train(cfg: SNNConfig = None):
                         global_update=global_update,
                     )
                     params = model_cls.apply_bn_running_stats(
-                        params, bn_stats, cfg.resnet_bn_momentum
+                        params,
+                        bn_stats,
+                        cfg.resnet_bntt_momentum
+                        if cfg.resnet_norm == "bntt"
+                        else cfg.resnet_bn_momentum,
                     )
                 else:
                     val_out, forward_eval_s = profiler.stage_timed_call(
@@ -1504,10 +1509,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--N", type=int, default=None, help="Override n_inputs")
     parser.add_argument("--hidden_size", type=int, default=None)
     parser.add_argument("--resnet_channels_base", type=int, default=None)
-    parser.add_argument("--resnet_norm", type=str, default=None, choices=["group", "batch"])
+    parser.add_argument("--resnet_norm", type=str, default=None, choices=["group", "batch", "bntt"])
     parser.add_argument("--resnet_norm_groups", type=int, default=None)
     parser.add_argument("--resnet_bn_momentum", type=float, default=None)
     parser.add_argument("--resnet_bn_eps", type=float, default=None)
+    parser.add_argument("--resnet_bntt_momentum", type=float, default=None)
+    parser.add_argument("--resnet_bntt_eps", type=float, default=None)
+    parser.add_argument(
+        "--resnet_bntt_affine_bias",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--conv_es_mode",
+        type=str,
+        default=None,
+        choices=["kernel_lora", "matrix_lora"],
+    )
     parser.add_argument("--resnet_threshold_scale", action="store_true", help="Scale threshold by 2**stage_idx per stage")
     parser.add_argument(
         "--selective_stage_perturbation",
@@ -1624,6 +1642,26 @@ def build_config_from_args(args) -> SNNConfig:
             args.resnet_bn_eps
             if args.resnet_bn_eps is not None
             else base_cfg.resnet_bn_eps
+        ),
+        resnet_bntt_momentum=(
+            args.resnet_bntt_momentum
+            if args.resnet_bntt_momentum is not None
+            else base_cfg.resnet_bntt_momentum
+        ),
+        resnet_bntt_eps=(
+            args.resnet_bntt_eps
+            if args.resnet_bntt_eps is not None
+            else base_cfg.resnet_bntt_eps
+        ),
+        resnet_bntt_affine_bias=(
+            args.resnet_bntt_affine_bias
+            if args.resnet_bntt_affine_bias is not None
+            else base_cfg.resnet_bntt_affine_bias
+        ),
+        conv_es_mode=(
+            args.conv_es_mode
+            if args.conv_es_mode is not None
+            else base_cfg.conv_es_mode
         ),
         resnet_threshold_scale=args.resnet_threshold_scale,
         selective_stage_perturbation=(

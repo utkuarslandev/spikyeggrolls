@@ -58,6 +58,10 @@ def test_cifar_model_defaults_reflect_debug_baseline_architecture():
     assert cfg.resnet_norm_groups == 8
     assert cfg.resnet_bn_momentum == 0.9
     assert cfg.resnet_bn_eps == 1e-5
+    assert cfg.resnet_bntt_momentum == 0.9
+    assert cfg.resnet_bntt_eps == 1e-5
+    assert cfg.resnet_bntt_affine_bias is False
+    assert cfg.conv_es_mode == "kernel_lora"
     assert cfg.sigma_min == 0.0025
     assert cfg.sigma_max == 0.012
     assert cfg.sigma_target_success == 0.20

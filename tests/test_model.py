@@ -182,11 +182,18 @@ def test_cli_profile_flags_roundtrip():
             "--profile_eval_once",
             "--no-profile_sync_timings",
             "--resnet_norm",
-            "batch",
+            "bntt",
             "--resnet_bn_momentum",
             "0.8",
             "--resnet_bn_eps",
             "0.0001",
+            "--resnet_bntt_momentum",
+            "0.7",
+            "--resnet_bntt_eps",
+            "0.0002",
+            "--resnet_bntt_affine_bias",
+            "--conv_es_mode",
+            "matrix_lora",
             "--sigma_target_success",
             "0.25",
             "--sigma_success_tolerance",
@@ -210,9 +217,13 @@ def test_cli_profile_flags_roundtrip():
     assert cfg.profile_updates_window == 4
     assert cfg.profile_eval_once is True
     assert cfg.profile_sync_timings is False
-    assert cfg.resnet_norm == "batch"
+    assert cfg.resnet_norm == "bntt"
     assert cfg.resnet_bn_momentum == pytest.approx(0.8)
     assert cfg.resnet_bn_eps == pytest.approx(0.0001)
+    assert cfg.resnet_bntt_momentum == pytest.approx(0.7)
+    assert cfg.resnet_bntt_eps == pytest.approx(0.0002)
+    assert cfg.resnet_bntt_affine_bias is True
+    assert cfg.conv_es_mode == "matrix_lora"
     assert cfg.sigma_target_success == pytest.approx(0.25)
     assert cfg.sigma_success_tolerance == pytest.approx(0.05)
     assert cfg.sigma_growth == pytest.approx(1.03)

@@ -133,6 +133,50 @@ class EggRoll(Noiser):
         return (flat_param + A @ B.T).reshape(param.shape)
 
     @classmethod
+    def do_conv2d_matrix_lora(
+        cls,
+        frozen_noiser_params,
+        noiser_params,
+        param,
+        base_key,
+        iterinfo,
+        x,
+        *,
+        stride: int,
+        padding: int,
+    ):
+        base_out = jax.lax.conv_general_dilated(
+            x,
+            param,
+            window_strides=(stride, stride),
+            padding=((padding, padding), (padding, padding)),
+            dimension_numbers=("NCHW", "OIHW", "NCHW"),
+        )
+        if iterinfo is None:
+            return base_out
+
+        flat_param = _flatten_conv_kernel(param)
+        A, B = get_lora_update_params(
+            frozen_noiser_params,
+            noiser_params["sigma"] / jnp.sqrt(frozen_noiser_params["rank"]),
+            iterinfo,
+            flat_param,
+            base_key,
+        )
+        patches = jax.lax.conv_general_dilated_patches(
+            x,
+            filter_shape=param.shape[2:],
+            window_strides=(stride, stride),
+            padding=((padding, padding), (padding, padding)),
+            dimension_numbers=("NCHW", "OIHW", "NCHW"),
+        )
+        batch, patch_dim, out_h, out_w = patches.shape
+        flat_patches = jnp.transpose(patches, (0, 2, 3, 1)).reshape(-1, patch_dim)
+        delta = (flat_patches @ B) @ A.T
+        delta = delta.reshape(batch, out_h, out_w, param.shape[0]).transpose(0, 3, 1, 2)
+        return base_out + delta
+
+    @classmethod
     def convert_fitnesses(cls, frozen_noiser_params, noiser_params, raw_scores, num_episodes_list=None):
         group_size = frozen_noiser_params["group_size"]
         shaping = frozen_noiser_params.get("fitness_shaping", "zscore")

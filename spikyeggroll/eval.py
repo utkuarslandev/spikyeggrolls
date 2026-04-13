@@ -19,7 +19,7 @@ def evaluate(
 ):
     """Evaluate model accuracy on spike-encoded inputs using base parameters."""
     model_cls = get_model_cls(cfg.model_name)
-    if cfg.model_name == "spiking_resnet18" and cfg.resnet_norm == "batch":
+    if cfg.model_name == "spiking_resnet18" and cfg.resnet_norm in {"batch", "bntt"}:
         outputs = model_cls.forward(
             EggRoll,
             frozen_noiser_params,
