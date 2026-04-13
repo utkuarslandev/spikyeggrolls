@@ -50,7 +50,7 @@ For raw chronology, commands, and day-by-day notes, see
   - pure-spiking CIFAR learning is still weak relative to compute spent
   - sigma still decays to the floor late in training even on the stronger Phase 3 baseline
   - `bntt` does not clearly beat the `batch` baseline in the current ES regime
-  - `matrix_lora` is still the main unbenchmarked Phase 3 candidate
+  - the current `matrix_lora` implementation is a severe runtime regression and is not a viable baseline candidate
 
 ## Active Baselines
 
@@ -60,6 +60,7 @@ For raw chronology, commands, and day-by-day notes, see
 | Pre-Phase 3 reference | `cifar5090-r2-p4096-t16-c32-b48-k96-bf16-trace2-20260412` | `batch=48`, `chunk=96`, `bf16`, pre-Phase 3 | `22.33%` best test |
 | Current Phase 3 baseline | `cifar5090-phase3-baseline-batch-kernel-20260413` | `batch + kernel_lora + selective perturbation` | `30` epochs, `300` updates, `1783.9s`, final `28.27%` |
 | Phase 3 BNTT comparison | `cifar5090-phase3-bntt-kernel` | `bntt + kernel_lora + selective perturbation` | `30` epochs, `300` updates, `1760.3s`, final `28.17%`, best checkpoint `26.39%` |
+| Phase 3 Matrix-LoRA comparison | `cifar5090-phase3-batch-matrix` | `batch + matrix_lora + selective perturbation` | killed at `epoch 8`; early selective `~7.47s`, full refresh `~191.4s` population score |
 
 ## Implementation Status
 
@@ -96,9 +97,9 @@ Validated:
 
 Benchmarked remotely:
 - `bntt + kernel_lora`
+- `batch + matrix_lora`
 
 Not yet benchmarked remotely:
-- `batch + matrix_lora`
 - `bntt + matrix_lora`
 
 ## What We Know
@@ -204,6 +205,51 @@ Interpretation:
 - learning is very close, but `batch` remains slightly better on both checkpoint-best and final test
 - `bntt` does not remove the late sigma collapse
 
+### Matrix-LoRA comparison result
+
+Started on `216.249.100.66:21650` from the same fresh clone baseline environment
+at commit `94d9afc`, then killed after the first full-refresh epoch because the
+runtime regression was already decisive.
+
+Run:
+- `cifar5090-phase3-batch-matrix`
+- `resnet_norm=batch`
+- `conv_es_mode=matrix_lora`
+
+Progress reached before stop:
+- reached `epoch 8`
+- reached the first `full_model_refresh`
+- GPU stayed busy and memory remained stable around `24.65 / 32.6 GiB`
+
+Observed learning before stop:
+- `epoch 5` test accuracy: `20.93%`
+
+Timing summary relative to the `batch + kernel_lora` baseline:
+- early selective:
+  - baseline `population_score_mean_s ≈ 2.37s`
+  - `matrix_lora ≈ 7.47s`
+- full refresh:
+  - baseline `≈ 15.64-19.25s`
+  - `matrix_lora ≈ 191.4s`
+- full-refresh total update mean:
+  - baseline `≈ 15.69-20.77s`
+  - `matrix_lora ≈ 193.1s`
+
+Interpretation:
+- the current `matrix_lora` implementation is not an optimization
+- it is about `3x` slower in early selective phases
+- it is about `10x+` slower in full-model refresh
+- learning at `epoch 5` was baseline-like and nowhere near enough to justify the cost
+- the likely loser is the patch-extraction delta path, not memory capacity
+
+Current recommendation:
+- keep `batch + kernel_lora` as the active Phase 3 baseline
+- do not benchmark `bntt + matrix_lora` yet
+- if `matrix_lora` is revisited, narrow it first:
+  - selective phases only
+  - late-stage convs only
+  - ideally `1x1` convs first
+
 ### Profiling conclusions so far
 
 - The dominant steady-state cost is still population scoring.
@@ -212,8 +258,12 @@ Interpretation:
 
 ## Open Questions
 
-- Does `matrix_lora` reduce `population_score_mean_s` on the 5090 without causing a memory problem?
-- Does `bntt + matrix_lora` beat the new baseline on both:
+- Can `matrix_lora` be salvaged by restricting it to:
+  - selective phases only
+  - late-stage convs only
+  - `1x1` convs first
+- Does a narrowed `matrix_lora` variant ever beat `kernel_lora` on the 5090?
+- Does any norm/forward combination beat the current `batch + kernel_lora` baseline on both:
   - wall-clock efficiency
   - early test accuracy
 
@@ -221,8 +271,10 @@ Interpretation:
 
 Run in this order:
 
-1. `batch + matrix_lora`
-2. `bntt + matrix_lora`
+1. preserve `batch + kernel_lora` as the active Phase 3 baseline
+2. do not rerun full-model `matrix_lora`
+3. if `matrix_lora` is revisited, benchmark a narrowed salvage variant first
+4. only consider `bntt + matrix_lora` after a narrowed `matrix_lora` path proves competitive
 
 Reference config:
 
@@ -243,7 +295,7 @@ Reference config:
 --profile_server_port 9999
 ```
 
-Variants to compare:
+Variants already compared:
 
 - Baseline:
   - `--resnet_norm batch`
@@ -254,9 +306,12 @@ Variants to compare:
 - Matrix-LoRA only:
   - `--resnet_norm batch`
   - `--conv_es_mode matrix_lora`
+
+Variants not yet worth running:
 - Combined:
   - `--resnet_norm bntt`
   - `--conv_es_mode matrix_lora`
+  - blocked until `matrix_lora` itself is competitive
 
 ## Decision Rules
 
@@ -271,8 +326,8 @@ Track:
 - `raw_score_std`
 
 Success criteria:
-- `matrix_lora` is worth keeping if it materially lowers population-score cost without breaking memory behavior
-- `bntt + matrix_lora` becomes the new baseline only if it improves the overall speed/learning tradeoff, not just one side of it
+- `matrix_lora` is worth revisiting only if a narrowed implementation materially lowers population-score cost without breaking memory behavior
+- `bntt + matrix_lora` should not be considered a baseline candidate until `matrix_lora` itself is competitive
 
 ## Reference Docs
 
