@@ -159,6 +159,7 @@ def test_cli_cifar_resnet_defaults_enable_perf_path():
 
     assert cfg.fitness_shaping == "centered_rank"
     assert cfg.use_batched_update is True
+    assert cfg.sigma_min == pytest.approx(0.0025)
     assert cfg.sigma_max == pytest.approx(0.012)
 
 
@@ -180,6 +181,22 @@ def test_cli_profile_flags_roundtrip():
             "4",
             "--profile_eval_once",
             "--no-profile_sync_timings",
+            "--resnet_norm",
+            "batch",
+            "--resnet_bn_momentum",
+            "0.8",
+            "--resnet_bn_eps",
+            "0.0001",
+            "--sigma_target_success",
+            "0.25",
+            "--sigma_success_tolerance",
+            "0.05",
+            "--sigma_growth",
+            "1.03",
+            "--sigma_decay",
+            "0.98",
+            "--sigma_ema_decay",
+            "0.85",
         ]
     )
 
@@ -193,6 +210,14 @@ def test_cli_profile_flags_roundtrip():
     assert cfg.profile_updates_window == 4
     assert cfg.profile_eval_once is True
     assert cfg.profile_sync_timings is False
+    assert cfg.resnet_norm == "batch"
+    assert cfg.resnet_bn_momentum == pytest.approx(0.8)
+    assert cfg.resnet_bn_eps == pytest.approx(0.0001)
+    assert cfg.sigma_target_success == pytest.approx(0.25)
+    assert cfg.sigma_success_tolerance == pytest.approx(0.05)
+    assert cfg.sigma_growth == pytest.approx(1.03)
+    assert cfg.sigma_decay == pytest.approx(0.98)
+    assert cfg.sigma_ema_decay == pytest.approx(0.85)
 
 
 def test_cli_rejects_removed_legacy_resnet_flags():
@@ -264,6 +289,7 @@ def test_train_updates_per_epoch_and_sigma_max(monkeypatch, tmp_path):
     assert epoch_records[0]["global_update"] == 3
     assert epoch_records[1]["global_update"] == 6
     assert all(r["sigma"] <= cfg.sigma_max + 1e-8 for r in epoch_records)
+    assert all(r["sigma_action"] in {"grow", "hold", "decay"} for r in epoch_records)
     assert summary["completed_updates"] == 6
     assert 0.0 <= test_acc <= 1.0
 

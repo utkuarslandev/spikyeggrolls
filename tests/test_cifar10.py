@@ -9,7 +9,11 @@ from hyperscalees.models.common import ConvKernel, simple_es_tree_key
 from hyperscalees.noiser.eggroll import EggRoll
 from spikyeggroll.data.cifar10 import augment_batch, encode_batch
 from spikyeggroll.configs import SNNConfig
-from spikyeggroll.models.spiking_resnet import BasicBlock, SpikingResNet18Model
+from spikyeggroll.models.spiking_resnet import (
+    BasicBlock,
+    BatchNorm2d,
+    SpikingResNet18Model,
+)
 from spikyeggroll.train import compute_fitness
 from spikyeggroll.models.snn import SNNModel
 
@@ -79,26 +83,18 @@ def _score_population(model_cls, frozen_noiser_params, noiser_params, frozen_par
     return lambda iterinfo: jax.vmap(compute_fitness, in_axes=(0, None))(forward_pop(iterinfo), y)
 
 
-@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
-def test_spiking_resnet_forward_shape(dtype):
-    key = jax.random.key(1)
-    k1, k2, k3 = jax.random.split(key, 3)
-    cfg = SNNConfig(
-        dataset="cifar10",
-        model_name="spiking_resnet18",
-        n_inputs=3072,
-        n_classes=10,
-        timesteps=4,
-        pop_size=8,
-        dtype=dtype,
-    )
+def _init_resnet(cfg, key):
+    k1, k2 = jax.random.split(key)
     frozen_params, params, scan_map, _ = SpikingResNet18Model.rand_init(k1, cfg)
     es_tree_key = simple_es_tree_key(params, k2, scan_map)
     frozen_noiser_params, noiser_params = EggRoll.init_noiser(
         params, cfg.sigma, cfg.lr, rank=cfg.rank
     )
-    x = jax.random.bernoulli(k3, 0.3, (4, 4, 3, 32, 32)).astype(jnp.float32)
-    out = SpikingResNet18Model.forward(
+    return frozen_params, params, es_tree_key, frozen_noiser_params, noiser_params
+
+
+def _updated_batchnorm_params(cfg, frozen_params, params, es_tree_key, frozen_noiser_params, noiser_params, x):
+    logits, bn_stats = SpikingResNet18Model.forward_train_with_bn_stats(
         EggRoll,
         frozen_noiser_params,
         noiser_params,
@@ -108,6 +104,57 @@ def test_spiking_resnet_forward_shape(dtype):
         None,
         x,
     )
+    params = SpikingResNet18Model.apply_bn_running_stats(
+        params, bn_stats, cfg.resnet_bn_momentum
+    )
+    return logits, params
+
+
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+@pytest.mark.parametrize("resnet_norm", ["group", "batch"])
+def test_spiking_resnet_forward_shape(dtype, resnet_norm):
+    key = jax.random.key(1)
+    k1, k2 = jax.random.split(key)
+    cfg = SNNConfig(
+        dataset="cifar10",
+        model_name="spiking_resnet18",
+        n_inputs=3072,
+        n_classes=10,
+        timesteps=4,
+        pop_size=8,
+        dtype=dtype,
+        resnet_norm=resnet_norm,
+    )
+    frozen_params, params, es_tree_key, frozen_noiser_params, noiser_params = _init_resnet(
+        cfg, k1
+    )
+    x = jax.random.bernoulli(k2, 0.3, (4, 4, 3, 32, 32)).astype(jnp.float32)
+    if resnet_norm == "batch":
+        _, params = _updated_batchnorm_params(
+            cfg, frozen_params, params, es_tree_key, frozen_noiser_params, noiser_params, x
+        )
+        out = SpikingResNet18Model.forward(
+            EggRoll,
+            frozen_noiser_params,
+            noiser_params,
+            frozen_params,
+            params,
+            es_tree_key,
+            None,
+            x,
+            norm_training=False,
+        )
+    else:
+        out = SpikingResNet18Model.forward(
+            EggRoll,
+            frozen_noiser_params,
+            noiser_params,
+            frozen_params,
+            params,
+            es_tree_key,
+            None,
+            x,
+        )
     assert out.shape == (4, 10)
     assert jnp.all(jnp.isfinite(out))
 
@@ -148,6 +195,21 @@ def test_spiking_resnet_forward_debug_reports_activity():
     assert jnp.isfinite(stats["output_class_variance_mean"])
 
 
+def test_batchnorm2d_init_marks_running_stats_excluded():
+    key = jax.random.key(31)
+    frozen_params, params, scan_map, es_map = BatchNorm2d.rand_init(
+        key, channels=8, dtype="float32"
+    )
+    assert params["running_mean"].shape == (8,)
+    assert params["running_var"].shape == (8,)
+    assert scan_map["running_mean"] == ()
+    assert scan_map["running_var"] == ()
+    assert es_map["running_mean"] == 3
+    assert es_map["running_var"] == 3
+    assert frozen_params["momentum"] == pytest.approx(0.9)
+    assert frozen_params["eps"] == pytest.approx(1e-5)
+
+
 def test_projection_shortcuts_exist_on_stride_transitions():
     key = jax.random.key(3)
     cfg = SNNConfig(dataset="cifar10", model_name="spiking_resnet18", n_classes=10)
@@ -158,54 +220,97 @@ def test_projection_shortcuts_exist_on_stride_transitions():
     assert "shortcut" in params["stage3_block0"]
 
 
-def test_eval_forward_is_batch_order_invariant():
+@pytest.mark.parametrize("resnet_norm", ["group", "batch"])
+def test_eval_forward_is_batch_order_invariant(resnet_norm):
     key = jax.random.key(4)
     k1, k2, k3 = jax.random.split(key, 3)
-    cfg = SNNConfig(dataset="cifar10", model_name="spiking_resnet18", timesteps=4, pop_size=8)
-    frozen_params, params, scan_map, _ = SpikingResNet18Model.rand_init(k1, cfg)
-    es_tree_key = simple_es_tree_key(params, k2, scan_map)
-    frozen_noiser_params, noiser_params = EggRoll.init_noiser(
-        params, cfg.sigma, cfg.lr, rank=cfg.rank
+    cfg = SNNConfig(
+        dataset="cifar10",
+        model_name="spiking_resnet18",
+        timesteps=4,
+        pop_size=8,
+        resnet_norm=resnet_norm,
+    )
+    frozen_params, params, es_tree_key, frozen_noiser_params, noiser_params = _init_resnet(
+        cfg, k1
     )
     x = jax.random.bernoulli(k3, 0.3, (4, 4, 3, 32, 32)).astype(jnp.float32)
     perm = jnp.array([2, 0, 3, 1])
-
-    out = SpikingResNet18Model.forward(
-        EggRoll,
-        frozen_noiser_params,
-        noiser_params,
-        frozen_params,
-        params,
-        es_tree_key,
-        None,
-        x,
-    )
-    perm_out = SpikingResNet18Model.forward(
-        EggRoll,
-        frozen_noiser_params,
-        noiser_params,
-        frozen_params,
-        params,
-        es_tree_key,
-        None,
-        x[perm],
-    )
+    if resnet_norm == "batch":
+        _, params = _updated_batchnorm_params(
+            cfg, frozen_params, params, es_tree_key, frozen_noiser_params, noiser_params, x
+        )
+        out = SpikingResNet18Model.forward(
+            EggRoll,
+            frozen_noiser_params,
+            noiser_params,
+            frozen_params,
+            params,
+            es_tree_key,
+            None,
+            x,
+            norm_training=False,
+        )
+        perm_out = SpikingResNet18Model.forward(
+            EggRoll,
+            frozen_noiser_params,
+            noiser_params,
+            frozen_params,
+            params,
+            es_tree_key,
+            None,
+            x[perm],
+            norm_training=False,
+        )
+    else:
+        out = SpikingResNet18Model.forward(
+            EggRoll,
+            frozen_noiser_params,
+            noiser_params,
+            frozen_params,
+            params,
+            es_tree_key,
+            None,
+            x,
+        )
+        perm_out = SpikingResNet18Model.forward(
+            EggRoll,
+            frozen_noiser_params,
+            noiser_params,
+            frozen_params,
+            params,
+            es_tree_key,
+            None,
+            x[perm],
+        )
     assert jnp.allclose(out, perm_out[jnp.argsort(perm)], atol=1e-6, rtol=1e-6)
 
 
-def test_eval_forward_is_independent_of_batch_companions():
+@pytest.mark.parametrize("resnet_norm", ["group", "batch"])
+def test_eval_forward_is_independent_of_batch_companions(resnet_norm):
     key = jax.random.key(12)
     k1, k2, k3 = jax.random.split(key, 3)
-    cfg = SNNConfig(dataset="cifar10", model_name="spiking_resnet18", timesteps=4, pop_size=8)
-    frozen_params, params, scan_map, _ = SpikingResNet18Model.rand_init(k1, cfg)
-    es_tree_key = simple_es_tree_key(params, k2, scan_map)
-    frozen_noiser_params, noiser_params = EggRoll.init_noiser(
-        params, cfg.sigma, cfg.lr, rank=cfg.rank
+    cfg = SNNConfig(
+        dataset="cifar10",
+        model_name="spiking_resnet18",
+        timesteps=4,
+        pop_size=8,
+        resnet_norm=resnet_norm,
+    )
+    frozen_params, params, es_tree_key, frozen_noiser_params, noiser_params = _init_resnet(
+        cfg, k1
     )
     samples = jax.random.bernoulli(k3, 0.3, (3, 4, 3, 32, 32)).astype(jnp.float32)
+    if resnet_norm == "batch":
+        _, params = _updated_batchnorm_params(
+            cfg, frozen_params, params, es_tree_key, frozen_noiser_params, noiser_params, samples
+        )
 
     batch_a = jnp.stack([samples[0], samples[1]], axis=0)
     batch_b = jnp.stack([samples[0], samples[2]], axis=0)
+    common_kwargs = {
+        "norm_training": False,
+    } if resnet_norm == "batch" else {}
     out_a = SpikingResNet18Model.forward(
         EggRoll,
         frozen_noiser_params,
@@ -215,6 +320,7 @@ def test_eval_forward_is_independent_of_batch_companions():
         es_tree_key,
         None,
         batch_a,
+        **common_kwargs,
     )
     out_b = SpikingResNet18Model.forward(
         EggRoll,
@@ -225,6 +331,7 @@ def test_eval_forward_is_independent_of_batch_companions():
         es_tree_key,
         None,
         batch_b,
+        **common_kwargs,
     )
     assert jnp.allclose(out_a[0], out_b[0], atol=1e-6, rtol=1e-6)
 
@@ -279,27 +386,101 @@ def test_chunked_population_scoring_matches_python_loop():
     assert jnp.allclose(expected, actual, atol=1e-6, rtol=1e-6)
 
 
-def test_sew_block_output_is_integer_valued():
-    """SEW pattern: both branches binary before add, so output ∈ {0, 1, 2}."""
+def test_identity_block_has_two_state_tensors_and_nonspiking_shortcut():
     key = jax.random.key(99)
-    k1, k2 = jax.random.split(key)
+    k1, k2, k3 = jax.random.split(key, 3)
     cfg = SNNConfig(dataset="cifar10", model_name="spiking_resnet18")
-    block_init = BasicBlock.rand_init(k1, 64, 128, 2, cfg)
-    frozen_params, params, scan_map, _ = block_init
+    frozen_params, params, scan_map, _ = BasicBlock.rand_init(k1, 64, 64, 1, cfg)
     es_tree_key = simple_es_tree_key(params, k2, scan_map)
     fnp, np_ = EggRoll.init_noiser(params, 0.01, 0.001, rank=1)
     cp = CommonParams(EggRoll, fnp, np_, frozen_params, params, es_tree_key, None)
 
-    x = jax.random.uniform(jax.random.key(1), (2, 64, 16, 16))
-    # SEW: 3-tuple state (v1, v2, v_sc)
-    state = (jnp.zeros((2, 128, 8, 8)), jnp.zeros((2, 128, 8, 8)), jnp.zeros((2, 128, 8, 8)))
+    x = jax.random.uniform(k3, (2, 64, 16, 16))
+    state = (jnp.zeros_like(x), jnp.zeros_like(x))
     out, new_state, stats = BasicBlock._forward(cp, x, state, collect_stats=True)
 
-    assert len(new_state) == 3                         # (v1, v2, v_sc)
-    assert jnp.all(out >= 0)
-    assert jnp.all(out == jnp.floor(out))              # integer-valued
-    assert float(out.max()) <= 2.0                     # SEW max: 1+1=2
-    assert "shortcut_rate" in stats
+    assert "shortcut" not in params
+    assert len(new_state) == 2
+    assert out.shape == x.shape
+    assert "shortcut_nonzero_fraction" in stats
+    assert jnp.any(out != jnp.floor(out))
+
+
+def test_projection_block_applies_projection_without_shortcut_state():
+    key = jax.random.key(100)
+    k1, k2, k3 = jax.random.split(key, 3)
+    cfg = SNNConfig(dataset="cifar10", model_name="spiking_resnet18")
+    frozen_params, params, scan_map, _ = BasicBlock.rand_init(k1, 64, 128, 2, cfg)
+    es_tree_key = simple_es_tree_key(params, k2, scan_map)
+    fnp, np_ = EggRoll.init_noiser(params, 0.01, 0.001, rank=1)
+    cp = CommonParams(EggRoll, fnp, np_, frozen_params, params, es_tree_key, None)
+
+    x = jax.random.uniform(k3, (2, 64, 16, 16))
+    state = (jnp.zeros((2, 128, 8, 8)), jnp.zeros((2, 128, 8, 8)))
+    out, new_state, _ = BasicBlock._forward(cp, x, state, collect_stats=True)
+
+    assert "shortcut" in params
+    assert len(new_state) == 2
+    assert out.shape == (2, 128, 8, 8)
+
+
+def test_batchnorm_running_stats_update_only_from_base_forward():
+    key = jax.random.key(77)
+    k1, k2 = jax.random.split(key)
+    cfg = SNNConfig(
+        dataset="cifar10",
+        model_name="spiking_resnet18",
+        timesteps=4,
+        pop_size=4,
+        resnet_norm="batch",
+    )
+    frozen_params, params, es_tree_key, frozen_noiser_params, noiser_params = _init_resnet(
+        cfg, k1
+    )
+    x = jax.random.bernoulli(k2, 0.3, (2, 4, 3, 32, 32)).astype(jnp.float32)
+
+    _, bn_stats = SpikingResNet18Model.forward_train_with_bn_stats(
+        EggRoll,
+        frozen_noiser_params,
+        noiser_params,
+        frozen_params,
+        params,
+        es_tree_key,
+        None,
+        x,
+    )
+    updated_params = SpikingResNet18Model.apply_bn_running_stats(
+        params, bn_stats, cfg.resnet_bn_momentum
+    )
+    before_noisy_mean = updated_params["stem_norm"]["running_mean"]
+    before_noisy_var = updated_params["stage0_block0"]["norm1"]["running_var"]
+
+    assert not jnp.allclose(
+        params["stem_norm"]["running_mean"],
+        updated_params["stem_norm"]["running_mean"],
+    )
+    assert not jnp.allclose(
+        params["stage0_block0"]["norm1"]["running_var"],
+        updated_params["stage0_block0"]["norm1"]["running_var"],
+    )
+
+    iterinfo = (jnp.zeros(cfg.pop_size, dtype=jnp.int32), jnp.arange(cfg.pop_size))
+    _ = jax.vmap(
+        lambda info: SpikingResNet18Model.forward(
+            EggRoll,
+            frozen_noiser_params,
+            noiser_params,
+            frozen_params,
+            updated_params,
+            es_tree_key,
+            info,
+            x,
+            norm_training=True,
+        )
+    )(iterinfo)
+
+    assert jnp.allclose(before_noisy_mean, updated_params["stem_norm"]["running_mean"])
+    assert jnp.allclose(before_noisy_var, updated_params["stage0_block0"]["norm1"]["running_var"])
 
 
 def test_augment_batch_shape_and_range():

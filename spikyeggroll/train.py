@@ -111,6 +111,16 @@ def compute_fitness(spike_counts, labels):
     return -ce
 
 
+def _sigma_action(cfg: SNNConfig, ema_success: float):
+    lower = cfg.sigma_target_success - cfg.sigma_success_tolerance
+    upper = cfg.sigma_target_success + cfg.sigma_success_tolerance
+    if ema_success > upper:
+        return "grow", cfg.sigma_growth
+    if ema_success < lower:
+        return "decay", cfg.sigma_decay
+    return "hold", 1.0
+
+
 def summarize_output_activity(outputs):
     return {
         "output_nonzero_fraction": float(jnp.mean(outputs != 0)),
@@ -610,6 +620,12 @@ def train(cfg: SNNConfig = None):
         f"EGGROLL: pop={N}, rank={cfg.rank}, sigma={cfg.sigma}, lr={cfg.lr}, "
         f"shape={cfg.fitness_shaping}, batched_update={cfg.use_batched_update}"
     )
+    print(
+        "Sigma control: "
+        f"target={cfg.sigma_target_success:.3f}±{cfg.sigma_success_tolerance:.3f} "
+        f"grow={cfg.sigma_growth:.3f} decay={cfg.sigma_decay:.3f} "
+        f"ema={cfg.sigma_ema_decay:.3f} clip=[{cfg.sigma_min:.4f}, {cfg.sigma_max:.4f}]"
+    )
     total_updates = cfg.num_epochs * cfg.updates_per_epoch
     total_samples = total_updates * cfg.batch_size
     if cfg.dataset == "cifar10":
@@ -637,25 +653,84 @@ def train(cfg: SNNConfig = None):
         W1 = params["linear1"]["weight"]     # [hidden, n_inputs]
         return x_t @ W1.T                    # [T, B, hidden]
 
-    # JIT-compiled forward: population evaluation (with noise)
-    # vmap over iterinfo only — input batch and l1_base shared across population
-    jit_forward = jax.jit(
-        jax.vmap(
-            lambda n, p, i, x, l1b: model_cls.forward(
-                EggRoll, frozen_noiser_params, n,
-                frozen_params, p, es_tree_key, i, x, l1b
-            ),
-            in_axes=(None, None, 0, None, None),
-        )
+    use_resnet_batch_norm = (
+        cfg.model_name == "spiking_resnet18" and cfg.resnet_norm == "batch"
     )
 
-    # JIT-compiled forward: evaluation (no noise, iterinfo=None)
-    jit_forward_eval = jax.jit(
-        lambda n, p, x: model_cls.forward(
-            EggRoll, frozen_noiser_params, n,
-            frozen_params, p, es_tree_key, None, x
+    if use_resnet_batch_norm:
+        jit_forward = jax.jit(
+            jax.vmap(
+                lambda n, p, i, x, l1b: model_cls.forward(
+                    EggRoll,
+                    frozen_noiser_params,
+                    n,
+                    frozen_params,
+                    p,
+                    es_tree_key,
+                    i,
+                    x,
+                    l1b,
+                    norm_training=True,
+                ),
+                in_axes=(None, None, 0, None, None),
+            )
         )
-    )
+        jit_forward_eval = jax.jit(
+            lambda n, p, x: model_cls.forward(
+                EggRoll,
+                frozen_noiser_params,
+                n,
+                frozen_params,
+                p,
+                es_tree_key,
+                None,
+                x,
+                norm_training=False,
+            )
+        )
+        jit_forward_train_with_bn_stats = jax.jit(
+            lambda n, p, x: model_cls.forward_train_with_bn_stats(
+                EggRoll,
+                frozen_noiser_params,
+                n,
+                frozen_params,
+                p,
+                es_tree_key,
+                None,
+                x,
+            )
+        )
+    else:
+        jit_forward = jax.jit(
+            jax.vmap(
+                lambda n, p, i, x, l1b: model_cls.forward(
+                    EggRoll,
+                    frozen_noiser_params,
+                    n,
+                    frozen_params,
+                    p,
+                    es_tree_key,
+                    i,
+                    x,
+                    l1b,
+                ),
+                in_axes=(None, None, 0, None, None),
+            )
+        )
+
+        jit_forward_eval = jax.jit(
+            lambda n, p, x: model_cls.forward(
+                EggRoll,
+                frozen_noiser_params,
+                n,
+                frozen_params,
+                p,
+                es_tree_key,
+                None,
+                x,
+            )
+        )
+        jit_forward_train_with_bn_stats = None
 
     # JIT-compiled parameter update
     jit_update = jax.jit(
@@ -800,6 +875,11 @@ def train(cfg: SNNConfig = None):
             "event": "start",
             "run_name": cfg.run_name,
             "cfg": asdict(cfg),
+            "sigma_target_success": cfg.sigma_target_success,
+            "sigma_success_tolerance": cfg.sigma_success_tolerance,
+            "sigma_growth": cfg.sigma_growth,
+            "sigma_decay": cfg.sigma_decay,
+            "sigma_ema_decay": cfg.sigma_ema_decay,
             "timestamp": time.time(),
             "start_epoch": start_epoch,
             "global_update": global_update,
@@ -837,12 +917,25 @@ def train(cfg: SNNConfig = None):
 
                 # Evaluate base params (no noise) on this batch
                 profiler.log_startup("jit_forward_eval begin", epoch=epoch, global_update=global_update)
-                val_out, forward_eval_s = profiler.stage_timed_call(
-                    "forward_eval_s",
-                    lambda: jit_forward_eval(noiser_params, params, x_batch),
-                    epoch=epoch,
-                    global_update=global_update,
-                )
+                if use_resnet_batch_norm:
+                    (val_out, bn_stats), forward_eval_s = profiler.stage_timed_call(
+                        "forward_eval_s",
+                        lambda: jit_forward_train_with_bn_stats(
+                            noiser_params, params, x_batch
+                        ),
+                        epoch=epoch,
+                        global_update=global_update,
+                    )
+                    params = model_cls.apply_bn_running_stats(
+                        params, bn_stats, cfg.resnet_bn_momentum
+                    )
+                else:
+                    val_out, forward_eval_s = profiler.stage_timed_call(
+                        "forward_eval_s",
+                        lambda: jit_forward_eval(noiser_params, params, x_batch),
+                        epoch=epoch,
+                        global_update=global_update,
+                    )
                 epoch_timings["forward_eval_s"].append(forward_eval_s)
                 if not profiler.startup_trace_stopped:
                     profiler.maybe_snapshot("jit-forward-eval-ready", epoch=epoch, global_update=global_update)
@@ -917,13 +1010,16 @@ def train(cfg: SNNConfig = None):
                 if ema_success is None:
                     ema_success = success_rate
                 else:
-                    ema_success = 0.9 * ema_success + 0.1 * success_rate
+                    ema_success = (
+                        cfg.sigma_ema_decay * ema_success
+                        + (1.0 - cfg.sigma_ema_decay) * success_rate
+                    )
 
+                sigma_action = "hold"
                 if global_update >= cfg.sigma_warmup_epochs * cfg.updates_per_epoch:
-                    if ema_success > 0.2:
-                        noiser_params["sigma"] = noiser_params["sigma"] * 1.02
-                    elif ema_success < 0.2:
-                        noiser_params["sigma"] = noiser_params["sigma"] / 1.02
+                    sigma_action, sigma_factor = _sigma_action(cfg, float(ema_success))
+                    if sigma_action != "hold":
+                        noiser_params["sigma"] = noiser_params["sigma"] * sigma_factor
 
                 noiser_params["sigma"] = jnp.clip(
                     noiser_params["sigma"], cfg.sigma_min, cfg.sigma_max
@@ -986,6 +1082,7 @@ def train(cfg: SNNConfig = None):
                 "pop_size": N,
                 "success_rate": success_rate,
                 "ema_success": float(ema_success),
+                "sigma_action": sigma_action,
                 **output_activity,
                 "test_acc": test_acc,
                 "timestamp": time.time(),
@@ -1123,14 +1220,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--N", type=int, default=None, help="Override n_inputs")
     parser.add_argument("--hidden_size", type=int, default=None)
     parser.add_argument("--resnet_channels_base", type=int, default=None)
-    parser.add_argument("--resnet_norm", type=str, default=None, choices=["group"])
+    parser.add_argument("--resnet_norm", type=str, default=None, choices=["group", "batch"])
     parser.add_argument("--resnet_norm_groups", type=int, default=None)
+    parser.add_argument("--resnet_bn_momentum", type=float, default=None)
+    parser.add_argument("--resnet_bn_eps", type=float, default=None)
     parser.add_argument("--resnet_threshold_scale", action="store_true", help="Scale threshold by 2**stage_idx per stage")
     parser.add_argument("--pop_size", type=int, default=None)
     parser.add_argument("--rank", type=int, default=None)
     parser.add_argument("--sigma", type=float, default=None)
     parser.add_argument("--sigma_min", type=float, default=None)
     parser.add_argument("--sigma_max", type=float, default=None)
+    parser.add_argument("--sigma_target_success", type=float, default=None)
+    parser.add_argument("--sigma_success_tolerance", type=float, default=None)
+    parser.add_argument("--sigma_growth", type=float, default=None)
+    parser.add_argument("--sigma_decay", type=float, default=None)
+    parser.add_argument("--sigma_ema_decay", type=float, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--fitness_shaping", type=str, default=None, choices=["zscore", "centered_rank"])
     parser.add_argument(
@@ -1214,6 +1318,16 @@ def build_config_from_args(args) -> SNNConfig:
             if args.resnet_norm_groups is not None
             else base_cfg.resnet_norm_groups
         ),
+        resnet_bn_momentum=(
+            args.resnet_bn_momentum
+            if args.resnet_bn_momentum is not None
+            else base_cfg.resnet_bn_momentum
+        ),
+        resnet_bn_eps=(
+            args.resnet_bn_eps
+            if args.resnet_bn_eps is not None
+            else base_cfg.resnet_bn_eps
+        ),
         resnet_threshold_scale=args.resnet_threshold_scale,
         n_classes=base_cfg.n_classes,
         timesteps=args.timesteps if args.timesteps is not None else base_cfg.timesteps,
@@ -1225,6 +1339,31 @@ def build_config_from_args(args) -> SNNConfig:
             args.sigma_max
             if args.sigma_max is not None
             else (0.012 if is_cifar_resnet else base_cfg.sigma_max)
+        ),
+        sigma_target_success=(
+            args.sigma_target_success
+            if args.sigma_target_success is not None
+            else base_cfg.sigma_target_success
+        ),
+        sigma_success_tolerance=(
+            args.sigma_success_tolerance
+            if args.sigma_success_tolerance is not None
+            else base_cfg.sigma_success_tolerance
+        ),
+        sigma_growth=(
+            args.sigma_growth
+            if args.sigma_growth is not None
+            else base_cfg.sigma_growth
+        ),
+        sigma_decay=(
+            args.sigma_decay
+            if args.sigma_decay is not None
+            else base_cfg.sigma_decay
+        ),
+        sigma_ema_decay=(
+            args.sigma_ema_decay
+            if args.sigma_ema_decay is not None
+            else base_cfg.sigma_ema_decay
         ),
         lr=args.lr if args.lr is not None else base_cfg.lr,
         fitness_shaping=(

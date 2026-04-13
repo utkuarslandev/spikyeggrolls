@@ -27,6 +27,11 @@ class SNNConfig:
     sigma: float = 0.007
     sigma_min: float = 0.001
     sigma_max: float = 1.0
+    sigma_target_success: float = 0.20
+    sigma_success_tolerance: float = 0.03
+    sigma_growth: float = 1.02
+    sigma_decay: float = 0.99
+    sigma_ema_decay: float = 0.90
     lr: float = 0.005
     fitness_shaping: str = "zscore"
     use_batched_update: bool = False
@@ -68,6 +73,8 @@ class SNNConfig:
     )
     resnet_norm: str = "group"
     resnet_norm_groups: int = 8
+    resnet_bn_momentum: float = 0.9
+    resnet_bn_eps: float = 1e-5
     resnet_threshold_scale: bool = False  # if True, stage i uses threshold * 2**i
 
     # Run artifacts
@@ -84,3 +91,8 @@ class SNNConfig:
                 self.in_channels = 3
             if self.image_size == 28:
                 self.image_size = 32
+            if self.model_name == "spiking_resnet18":
+                if self.sigma_min == 0.001:
+                    self.sigma_min = 0.0025
+                if self.sigma_max == 1.0:
+                    self.sigma_max = 0.012

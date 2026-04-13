@@ -56,8 +56,15 @@ def test_cifar_model_defaults_reflect_debug_baseline_architecture():
     assert cfg.resnet_block_counts == (2, 2, 2, 2)
     assert cfg.resnet_norm == "group"
     assert cfg.resnet_norm_groups == 8
-    assert cfg.sigma_min == 0.001
-    assert cfg.sigma_max == 1.0
+    assert cfg.resnet_bn_momentum == 0.9
+    assert cfg.resnet_bn_eps == 1e-5
+    assert cfg.sigma_min == 0.0025
+    assert cfg.sigma_max == 0.012
+    assert cfg.sigma_target_success == 0.20
+    assert cfg.sigma_success_tolerance == 0.03
+    assert cfg.sigma_growth == 1.02
+    assert cfg.sigma_decay == 0.99
+    assert cfg.sigma_ema_decay == 0.90
     assert cfg.sigma_warmup_epochs == 20
     assert cfg.updates_per_epoch == 10
     assert cfg.fitness_shaping == "zscore"
