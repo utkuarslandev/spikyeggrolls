@@ -363,27 +363,44 @@ Baseline command:
   --run_name cifar5090-phase3-baseline-batch-kernel-20260413
 ```
 
-Observed by epoch 9 / update 100:
-- run healthy, no startup stall
-- GPU memory: about `24.65 / 32.6 GiB`
+Finished result:
+- run healthy end to end, no startup stall
+- GPU memory during training: about `24.65 / 32.6 GiB`
 - GPU utilization: sustained high utilization; occasional `0%` samples were just
   transient between-kernel snapshots
-- first test accuracy:
+- completed:
+  - `30` logged epochs
+  - `300` updates
+  - `1783.9s` wall-clock, about `29.7 min`
+- test accuracy checkpoints:
   - `epoch 5`: `20.73%`
+  - `epoch 10`: `23.81%`
+  - `epoch 15`: `25.89%`
+  - `epoch 20`: `26.19%`
+  - `epoch 25`: `26.98%`
+  - final summary: `28.27%`
 
 Timing by selective phase:
 - early selective (`stage3 + head`, `cache_split=after_stage2`):
   - `active_param_fraction ≈ 0.274`
   - `population_score_mean_s ≈ 2.35-2.38s`
   - `avg_update_s ≈ 3.6-3.8s`
-- full-model refresh (`epoch 8`):
+- full-model refresh (`epoch 8`, `epoch 16`, `epoch 24`):
   - `active_param_fraction = 1.0`
-  - `population_score_mean_s ≈ 19.25s`
-  - `avg_update_s ≈ 20.77s`
-- mid selective (`epoch 9`, `stage2 + stage3 + head`, `cache_split=after_stage1`):
+  - `population_score_mean_s ≈ 15.64-19.25s`
+  - `avg_update_s ≈ 15.69-20.77s`
+- mid selective (`stage2 + stage3 + head`, `cache_split=after_stage1`):
   - `active_param_fraction ≈ 0.516`
-  - `population_score_mean_s ≈ 6.75s`
-  - `avg_update_s ≈ 7.75s`
+  - initial transition epoch: `population_score_mean_s ≈ 6.75s`
+  - steady state: `population_score_mean_s ≈ 4.89s`
+  - steady-state `avg_update_s ≈ 4.93-4.95s`
+
+Sigma behavior:
+- held at `0.006` through most of training
+- resumed decay late:
+  - `epoch 20`: `0.00543`
+  - `epoch 25`: `0.00335`
+  - `epoch 28-29`: hit `sigma_min = 0.0025`
 
 Takeaway:
 - selective perturbation is not a cosmetic change; it dramatically changes wall
@@ -392,10 +409,11 @@ Takeaway:
   - early selective: cheapest
   - mid selective: intermediate
   - full refresh: very expensive
-- this baseline is the new reference for comparing:
+- this baseline is now the new reference for comparing:
   - `bntt + kernel_lora`
   - `batch + matrix_lora`
   - `bntt + matrix_lora`
+- it also exceeds the earlier pre-Phase 3 CIFAR best of `22.33%`
 | 256 | 0.865 | 7358 |
 | 128 | 0.843 | 4220 |
 | 64 | 0.995 | 9355 |

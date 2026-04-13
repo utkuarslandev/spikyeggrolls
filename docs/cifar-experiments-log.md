@@ -29,27 +29,35 @@ For raw chronology, commands, and day-by-day notes, see
     - `resnet_norm=batch`
     - `conv_es_mode=kernel_lora`
     - selective stage perturbation enabled
+  - finished:
+    - `30` logged epochs
+    - `300` updates
+    - `1783.9s` wall-clock
+    - final test accuracy: `28.27%`
 
 - Current best historical CIFAR result:
-  - `22.33%` test accuracy
-  - run: `cifar5090-r2-p4096-t16-c32-b48-k96-bf16-trace2-20260412`
-  - best seen at `epoch 20`
+  - `28.27%` final test accuracy
+  - run: `cifar5090-phase3-baseline-batch-kernel-20260413`
+  - same run also recorded checkpoint best `26.98%` at `epoch 25`
 
 - Best current Phase 3 baseline test seen so far:
-  - `20.73%` at `epoch 5`
+  - final test: `28.27%`
+  - checkpoint best: `26.98%` at `epoch 25`
   - run: `cifar5090-phase3-baseline-batch-kernel-20260413`
 
 - Current main bottlenecks:
   - population scoring still dominates wall clock
   - pure-spiking CIFAR learning is still weak relative to compute spent
-  - `bntt` and `matrix_lora` are implemented but not yet benchmarked on the 5090 against the new baseline
+  - sigma still decays to the floor late in training even on the stronger Phase 3 baseline
+  - `bntt` and `matrix_lora` are implemented but not yet benchmarked on the 5090 against the finished baseline
 
 ## Active Baselines
 
 | Role | Run | Key Config | Best / Current |
 |------|-----|------------|----------------|
-| Best historical accuracy | `cifar5090-r2-p4096-t16-c32-b48-k96-bf16-trace2-20260412` | `batch=48`, `chunk=96`, `bf16`, pre-Phase 3 | `22.33%` best test |
-| Current Phase 3 baseline | `cifar5090-phase3-baseline-batch-kernel-20260413` | `batch + kernel_lora + selective perturbation` | `20.73%` test at epoch 5 so far |
+| Best historical accuracy | `cifar5090-phase3-baseline-batch-kernel-20260413` | `batch + kernel_lora + selective perturbation` | `28.27%` final test, `26.98%` checkpoint best |
+| Pre-Phase 3 reference | `cifar5090-r2-p4096-t16-c32-b48-k96-bf16-trace2-20260412` | `batch=48`, `chunk=96`, `bf16`, pre-Phase 3 | `22.33%` best test |
+| Current Phase 3 baseline | `cifar5090-phase3-baseline-batch-kernel-20260413` | `batch + kernel_lora + selective perturbation` | `30` epochs, `300` updates, `1783.9s`, final `28.27%` |
 
 ## Implementation Status
 
@@ -109,15 +117,47 @@ Measured on `cifar5090-phase3-baseline-batch-kernel-20260413`:
   - `avg_update_s ≈ 3.6-3.8s`
 - full refresh:
   - `active_param_fraction = 1.0`
-  - `population_score_mean_s ≈ 19.25s`
-  - `avg_update_s ≈ 20.77s`
+  - `population_score_mean_s ≈ 15.64-19.25s`
+  - `avg_update_s ≈ 15.69-20.77s`
 - mid selective (`stage2 + stage3 + head`, `cache_split=after_stage1`):
   - `active_param_fraction ≈ 0.516`
-  - `population_score_mean_s ≈ 6.75s`
-  - `avg_update_s ≈ 7.75s`
+  - early transition epoch: `population_score_mean_s ≈ 6.75s`, `avg_update_s ≈ 7.75s`
+  - steady state: `population_score_mean_s ≈ 4.89s`, `avg_update_s ≈ 4.93-4.95s`
 
 This cost ordering is now established:
 - early selective < mid selective << full-model refresh
+
+### Finished baseline result
+
+Completed on `216.249.100.66:21650` from a fresh clone of `utkuarslandev/spikyeggrolls`
+at commit `94d9afc`.
+
+Final summary:
+- `30` logged epochs
+- `300` updates
+- `1783.9s` total wall-clock, about `29.7 min`
+- final test accuracy: `28.27%`
+- checkpoint best test accuracy: `26.98%` at `epoch 25`
+
+Observed test checkpoints:
+- `epoch 5`: `20.73%`
+- `epoch 10`: `23.81%`
+- `epoch 15`: `25.89%`
+- `epoch 20`: `26.19%`
+- `epoch 25`: `26.98%`
+- final summary: `28.27%`
+
+Optimizer behavior:
+- `sigma` held at `0.006` through the early and most of the mid-selective phase
+- late-training decay resumed:
+  - `epoch 20`: `0.00543`
+  - `epoch 25`: `0.00335`
+  - `epoch 28-29`: hit `sigma_min = 0.0025`
+
+Interpretation:
+- selective perturbation is operationally validated on the 5090
+- the Phase 3 baseline now materially exceeds the earlier `22.33%` pre-Phase 3 result
+- sigma collapse remains a real late-training limiter even on the improved baseline
 
 ### Profiling conclusions so far
 
