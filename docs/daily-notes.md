@@ -1,5 +1,15 @@
 # Daily Experiment Notes
 
+This file is the chronological lab notebook.
+
+Use it for:
+- day-by-day work logs
+- raw commands and observations
+- implementation milestones as they happened
+
+For the current CIFAR/ResNet state, active baseline, and next actions, see
+[docs/cifar-experiments-log.md](docs/cifar-experiments-log.md).
+
 ## March 31 — Project Bootstrap & Initial Benchmarks
 
 ### Pop_size throughput sweep (deterministic SCN, RTX 4080)
@@ -258,6 +268,134 @@ done
 | 2048 | 0.340 | 5142 |
 | 1024 | 0.375 | 5000 |
 | 512 | 0.543 | 5479 |
+
+---
+
+## April 13 — Phase 2/3 CIFAR ResNet Work, Validation, and New 5090 Baseline
+
+### Phase 2 selective-stage perturbation implementation
+
+Implemented:
+- stage-group taxonomy for `spiking_resnet18`
+- selective perturbation schedule:
+  - early: `stage3 + head`
+  - mid: `stage2 + stage3 + head`
+  - periodic full refresh
+- active ES-map masking by stage group
+- deterministic prefix caching with noisy suffix-only forward
+- per-epoch metrics:
+  - `perturbation_phase`
+  - `active_stage_groups`
+  - `cache_split`
+  - `active_param_fraction`
+
+Validation:
+```bash
+.venv/bin/python -m pytest tests/test_eggroll.py tests/test_lif.py tests/test_cifar10.py tests/test_model.py tests/test_runtime.py -q
+# 52 passed
+```
+
+Takeaway:
+- selective perturbation is implemented and locally validated
+- prefix/suffix cached forward matches full forward in tests
+- selective updates only touch the intended active stages
+
+### Phase 3 implementation: BNTT + conv `matrix_lora`
+
+Implemented:
+- new `resnet_norm="bntt"` mode with:
+  - per-timestep affine weights
+  - per-timestep running mean/variance
+  - timestep-aware scan/prefix/suffix forward handling
+- running-stat evaluation path extended from `batch` to `batch|bntt`
+- new `conv_es_mode`:
+  - `kernel_lora` (existing dense noisy-kernel path)
+  - `matrix_lora` (dense base conv + patch-space low-rank delta)
+
+Validation:
+- `tests/test_runtime.py` passed
+- `tests/test_model.py` passed
+- `tests/test_cifar10.py` passed
+
+Takeaway:
+- the repo now has both the literature-aligned BNTT path and the systems-facing
+  `matrix_lora` conv forward
+- local correctness is good, but 5090 performance/learning impact still needs
+  hardware comparison
+
+### Fresh remote baseline from GitHub clone
+
+Host:
+- `216.249.100.66:21650`
+
+Source:
+- fresh clone of `https://github.com/utkuarslandev/spikyeggrolls.git`
+- cloned commit reported as `94d9afc`
+
+Bootstrap:
+```bash
+make bootstrap-runpod
+```
+
+Baseline command:
+```bash
+.venv/bin/python -m spikyeggroll.train \
+  --dataset cifar10 --model_name spiking_resnet18 \
+  --pop_size 4096 --rank 2 --sigma 0.006 --lr 0.0015 \
+  --epochs 30 --updates_per_epoch 10 \
+  --timesteps 16 --batch_size 48 --chunk_size 96 \
+  --augment --dtype bfloat16 \
+  --resnet_channels_base 32 \
+  --resnet_norm batch \
+  --conv_es_mode kernel_lora \
+  --selective_stage_perturbation \
+  --stage_perturbation_schedule head_last_then_last2 \
+  --stage_perturbation_early_fraction 0.30 \
+  --stage_perturbation_full_epoch_interval 8 \
+  --sigma_warmup_epochs 20 \
+  --test_interval 5 --checkpoint_interval 10 --log_interval 1 \
+  --num_test_eval_samples 1024 \
+  --profile_mode steady_state \
+  --profile_warmup_updates 5 \
+  --profile_updates_window 3 \
+  --profile_eval_once \
+  --profile_server_port 9999 \
+  --run_name cifar5090-phase3-baseline-batch-kernel-20260413
+```
+
+Observed by epoch 9 / update 100:
+- run healthy, no startup stall
+- GPU memory: about `24.65 / 32.6 GiB`
+- GPU utilization: sustained high utilization; occasional `0%` samples were just
+  transient between-kernel snapshots
+- first test accuracy:
+  - `epoch 5`: `20.73%`
+
+Timing by selective phase:
+- early selective (`stage3 + head`, `cache_split=after_stage2`):
+  - `active_param_fraction ≈ 0.274`
+  - `population_score_mean_s ≈ 2.35-2.38s`
+  - `avg_update_s ≈ 3.6-3.8s`
+- full-model refresh (`epoch 8`):
+  - `active_param_fraction = 1.0`
+  - `population_score_mean_s ≈ 19.25s`
+  - `avg_update_s ≈ 20.77s`
+- mid selective (`epoch 9`, `stage2 + stage3 + head`, `cache_split=after_stage1`):
+  - `active_param_fraction ≈ 0.516`
+  - `population_score_mean_s ≈ 6.75s`
+  - `avg_update_s ≈ 7.75s`
+
+Takeaway:
+- selective perturbation is not a cosmetic change; it dramatically changes wall
+  clock cost
+- the runtime ordering is now explicit:
+  - early selective: cheapest
+  - mid selective: intermediate
+  - full refresh: very expensive
+- this baseline is the new reference for comparing:
+  - `bntt + kernel_lora`
+  - `batch + matrix_lora`
+  - `bntt + matrix_lora`
 | 256 | 0.865 | 7358 |
 | 128 | 0.843 | 4220 |
 | 64 | 0.995 | 9355 |
@@ -540,6 +678,11 @@ Takeaway:
   - `SPIKYEGGROLL_PROFILE_STARTUP=1`
   - `SPIKYEGGROLL_PROFILE_TRACE=1`
   - `SPIKYEGGROLL_PROFILE_SERVER_PORT=<port>`
+- These env vars were part of the original stall-debugging patch. The current
+  profiling interface is CLI/config driven via `--profile_mode`,
+  `--profile_trace_dir`, `--profile_server_port`, `--profile_max_snapshots`,
+  `--profile_warmup_updates`, `--profile_updates_window`, and
+  `--profile_eval_once`.
 - Commits pushed:
   - `fc80b53` `Add startup tracing for CIFAR training hangs`
   - `b802030` `Add gated startup memory profiling`
