@@ -49,7 +49,8 @@ For raw chronology, commands, and day-by-day notes, see
   - population scoring still dominates wall clock
   - pure-spiking CIFAR learning is still weak relative to compute spent
   - sigma still decays to the floor late in training even on the stronger Phase 3 baseline
-  - `bntt` and `matrix_lora` are implemented but not yet benchmarked on the 5090 against the finished baseline
+  - `bntt` does not clearly beat the `batch` baseline in the current ES regime
+  - `matrix_lora` is still the main unbenchmarked Phase 3 candidate
 
 ## Active Baselines
 
@@ -58,6 +59,7 @@ For raw chronology, commands, and day-by-day notes, see
 | Best historical accuracy | `cifar5090-phase3-baseline-batch-kernel-20260413` | `batch + kernel_lora + selective perturbation` | `28.27%` final test, `26.98%` checkpoint best |
 | Pre-Phase 3 reference | `cifar5090-r2-p4096-t16-c32-b48-k96-bf16-trace2-20260412` | `batch=48`, `chunk=96`, `bf16`, pre-Phase 3 | `22.33%` best test |
 | Current Phase 3 baseline | `cifar5090-phase3-baseline-batch-kernel-20260413` | `batch + kernel_lora + selective perturbation` | `30` epochs, `300` updates, `1783.9s`, final `28.27%` |
+| Phase 3 BNTT comparison | `cifar5090-phase3-bntt-kernel` | `bntt + kernel_lora + selective perturbation` | `30` epochs, `300` updates, `1760.3s`, final `28.17%`, best checkpoint `26.39%` |
 
 ## Implementation Status
 
@@ -92,8 +94,10 @@ Implemented:
 Validated:
 - local correctness tests passed
 
-Not yet benchmarked remotely:
+Benchmarked remotely:
 - `bntt + kernel_lora`
+
+Not yet benchmarked remotely:
 - `batch + matrix_lora`
 - `bntt + matrix_lora`
 
@@ -159,6 +163,47 @@ Interpretation:
 - the Phase 3 baseline now materially exceeds the earlier `22.33%` pre-Phase 3 result
 - sigma collapse remains a real late-training limiter even on the improved baseline
 
+### BNTT-only comparison result
+
+Completed on `216.249.100.66:21650` from the same fresh clone baseline environment
+at commit `94d9afc`.
+
+Run:
+- `cifar5090-phase3-bntt-kernel`
+- `resnet_norm=bntt`
+- `conv_es_mode=kernel_lora`
+
+Final summary:
+- `30` logged epochs
+- `300` updates
+- `1760.3s` total wall-clock, about `29.3 min`
+- final test accuracy: `28.17%`
+- checkpoint best test accuracy: `26.39%` at `epoch 25`
+
+Observed test checkpoints:
+- `epoch 10`: `23.91%`
+- `epoch 15`: `24.80%`
+- `epoch 20`: `25.60%`
+- `epoch 25`: `26.39%`
+- final summary: `28.17%`
+
+Timing summary relative to the `batch + kernel_lora` baseline:
+- early selective:
+  - baseline `population_score_mean_s ≈ 2.37s`
+  - `bntt` `≈ 2.42s`
+- mid selective:
+  - baseline `≈ 4.89s`
+  - `bntt` `≈ 4.94s`
+- full refresh:
+  - baseline `≈ 15.64-19.25s`
+  - `bntt` `≈ 15.59-17.13s`
+
+Interpretation:
+- `bntt` is essentially a wash against the `batch` baseline in this ES setting
+- runtime is almost unchanged
+- learning is very close, but `batch` remains slightly better on both checkpoint-best and final test
+- `bntt` does not remove the late sigma collapse
+
 ### Profiling conclusions so far
 
 - The dominant steady-state cost is still population scoring.
@@ -167,7 +212,6 @@ Interpretation:
 
 ## Open Questions
 
-- Does `bntt` improve equal-wall-clock CIFAR accuracy relative to `batch`?
 - Does `matrix_lora` reduce `population_score_mean_s` on the 5090 without causing a memory problem?
 - Does `bntt + matrix_lora` beat the new baseline on both:
   - wall-clock efficiency
@@ -177,9 +221,8 @@ Interpretation:
 
 Run in this order:
 
-1. `bntt + kernel_lora`
-2. `batch + matrix_lora`
-3. `bntt + matrix_lora`
+1. `batch + matrix_lora`
+2. `bntt + matrix_lora`
 
 Reference config:
 
@@ -228,7 +271,6 @@ Track:
 - `raw_score_std`
 
 Success criteria:
-- `bntt` is worth keeping if it improves or at least does not hurt early learning at equal wall clock
 - `matrix_lora` is worth keeping if it materially lowers population-score cost without breaking memory behavior
 - `bntt + matrix_lora` becomes the new baseline only if it improves the overall speed/learning tradeoff, not just one side of it
 

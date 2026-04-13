@@ -414,6 +414,77 @@ Takeaway:
   - `batch + matrix_lora`
   - `bntt + matrix_lora`
 - it also exceeds the earlier pre-Phase 3 CIFAR best of `22.33%`
+
+### BNTT-only remote comparison on the same 5090 host
+
+Host and source:
+- host: `216.249.100.66:21650`
+- repo: fresh clone of `utkuarslandev/spikyeggrolls`
+- commit: `94d9afc`
+
+Command:
+```bash
+.venv/bin/python -m spikyeggroll.train \
+  --dataset cifar10 --model_name spiking_resnet18 \
+  --pop_size 4096 --rank 2 --sigma 0.006 --lr 0.0015 \
+  --epochs 30 --updates_per_epoch 10 \
+  --timesteps 16 --batch_size 48 --chunk_size 96 \
+  --augment --dtype bfloat16 \
+  --resnet_channels_base 32 \
+  --resnet_norm bntt \
+  --resnet_bntt_momentum 0.9 \
+  --resnet_bntt_eps 1e-5 \
+  --conv_es_mode kernel_lora \
+  --selective_stage_perturbation \
+  --stage_perturbation_schedule head_last_then_last2 \
+  --stage_perturbation_early_fraction 0.30 \
+  --stage_perturbation_full_epoch_interval 8 \
+  --sigma_warmup_epochs 20 \
+  --test_interval 5 --checkpoint_interval 10 --log_interval 1 \
+  --num_test_eval_samples 1024 \
+  --profile_mode steady_state \
+  --profile_warmup_updates 5 \
+  --profile_updates_window 3 \
+  --profile_eval_once \
+  --profile_server_port 9999 \
+  --run_name cifar5090-phase3-bntt-kernel
+```
+
+Final result:
+- `30` epochs, `300` updates
+- `1760.3s` wall-clock
+- final test accuracy: `28.17%`
+- checkpoint best: `26.39%` at `epoch 25`
+
+Observed test checkpoints:
+- `epoch 10`: `23.91%`
+- `epoch 15`: `24.80%`
+- `epoch 20`: `25.60%`
+- `epoch 25`: `26.39%`
+- final summary: `28.17%`
+
+Comparison against the `batch + kernel_lora` baseline:
+- baseline final test: `28.27%`
+- `bntt` final test: `28.17%`
+- baseline checkpoint best: `26.98%`
+- `bntt` checkpoint best: `26.39%`
+
+Timing comparison:
+- early selective:
+  - baseline `population_score_mean_s ≈ 2.37s`
+  - `bntt ≈ 2.42s`
+- mid selective:
+  - baseline `≈ 4.89s`
+  - `bntt ≈ 4.94s`
+- full refresh:
+  - baseline `≈ 15.64-19.25s`
+  - `bntt ≈ 15.59-17.13s`
+
+Takeaway:
+- `bntt` is not a convincing improvement in the current ES regime
+- runtime is nearly unchanged
+- learning is extremely close, but `batch` remains slightly better
+- next meaningful comparison is `batch + matrix_lora`
 | 256 | 0.865 | 7358 |
 | 128 | 0.843 | 4220 |
 | 64 | 0.995 | 9355 |
