@@ -514,3 +514,194 @@ Takeaway:
   in [docs/cifar-resnet-phased-implementation-plan.md](docs/cifar-resnet-phased-implementation-plan.md).
 - That document is the primary source of truth for phase ordering, acceptance
   criteria, and the 5090 validation matrix.
+
+---
+
+## April 12 — CIFAR-10 / Spiking ResNet18 Startup Tracing and Heavy 5090 Runs
+
+### Code instrumentation added
+
+- Added startup tracing in `spikyeggroll/train.py` with timestamped markers
+  around:
+  - model init
+  - noiser init
+  - dataset load
+  - JIT wrapper creation
+  - prefetch warmup
+  - start-metric write
+  - first eval forward
+  - first population scoring step
+  - first update step
+- Added `jax.block_until_ready(...)` at the traced milestones so log ordering
+  reflects actual device completion rather than queued dispatch.
+- Added gated device-memory snapshots during startup.
+- Added a bounded startup trace mode and optional profiler server:
+  - `SPIKYEGGROLL_TRACE_STARTUP=1`
+  - `SPIKYEGGROLL_PROFILE_STARTUP=1`
+  - `SPIKYEGGROLL_PROFILE_TRACE=1`
+  - `SPIKYEGGROLL_PROFILE_SERVER_PORT=<port>`
+- Commits pushed:
+  - `fc80b53` `Add startup tracing for CIFAR training hangs`
+  - `b802030` `Add gated startup memory profiling`
+  - `db3e1c6` `Add startup trace capture controls`
+
+### Host-specific startup behavior
+
+#### Bad host: `216.249.100.66:21657`
+
+- Multiple heavy runs appeared to "hang" before normal training logs:
+  - `float32`, `batch_size=64`, `chunk_size=128`
+  - `bfloat16`, `batch_size=48`, `chunk_size=128`
+  - `bfloat16`, `batch_size=48`, `chunk_size=96`
+- Symptoms:
+  - process alive for hours
+  - GPU at `97-99%`
+  - GPU memory pinned around `29.4 / 32.6 GiB`
+  - no metrics file written
+  - log advanced only with repeated JAX/XLA warnings
+- Takeaway:
+  - this was not a normal "slow first epoch"
+  - the behavior was host/runtime specific enough to justify instrumentation
+
+#### Good host: `64.228.13.219:61195`
+
+- The same heavy traced config cleared startup and entered normal training:
+  - `pop_size=4096`
+  - `rank=2`
+  - `timesteps=16`
+  - `batch_size=48`
+  - `chunk_size=96`
+  - `dtype=bfloat16`
+- The run wrote the startup trace markers all the way through:
+  - `start metric written`
+  - first `jit_forward_eval`
+  - first `score_population_chunked`
+  - first `jit_update`
+- Important conclusion:
+  - the code path is not fundamentally deadlocking
+  - the earlier "stall" was at least partly machine-specific
+
+### Startup / compile timing from traced run
+
+Run:
+- `cifar5090-r2-p4096-t16-c32-b48-k96-bf16-trace2-20260412`
+
+Observed startup milestones on the good 5090 host:
+- `train() begin` at `16:35:39`
+- `model init complete` at `16:35:43`
+- `dataset loaded` at `16:35:47`
+- `start metric written` at `16:35:48`
+- first `jit_forward_eval` ready at `16:35:49`
+- first `population scores` ready at `16:36:15`
+- first `jit_update` ready at `16:36:18`
+- bounded startup trace stopped at `16:37:02`
+
+Approximate timings:
+- model init: `~3 s`
+- dataset load/download path on fresh host: `~4 s`
+- prefetch warmup: `~1 s`
+- first eval forward: `~1 s`
+- first population score: `~26 s`
+- first update: `~3 s`
+
+Takeaway:
+- the expensive startup region is the first population scoring/update path
+- dataset load and prefetch are not the bottleneck
+
+### Metrics path gotcha
+
+- Stdout logs were written under `/workspace/logs/spikyeggroll/...`
+- Metrics and checkpoints for direct `python -m spikyeggroll.train` runs were
+  still being written under repo-relative defaults:
+  - `/workspace/spikyeggrolls/logs/spikyeggroll/...`
+  - `/workspace/spikyeggrolls/checkpoints/spikyeggroll/...`
+- This caused an initial false impression that the good host had "no metrics"
+  when the run was actually progressing.
+
+### Current heavy run results on the good 5090 host
+
+Run:
+- `cifar5090-r2-p4096-t16-c32-b48-k96-bf16-trace2-20260412`
+
+Config:
+- `pop_size=4096`
+- `rank=2`
+- `sigma=0.006`
+- `lr=0.0015`
+- `timesteps=16`
+- `batch_size=48`
+- `chunk_size=96`
+- `dtype=bfloat16`
+- `augment=True`
+- `resnet_channels_base=32`
+- `updates_per_epoch=10`
+- `fitness_shaping=centered_rank`
+- `use_batched_update=True`
+
+Latest checked state:
+- `epoch 55`
+- `global_update 560`
+- GPU utilization: `99%`
+- GPU memory: `~29.46 / 32.6 GiB`
+- average update time: `~21.74 s`
+- average epoch time: `~217.4 s`
+
+Test accuracy history:
+- `epoch 0`: `10.01%`
+- `epoch 5`: `12.65%`
+- `epoch 10`: `16.26%`
+- `epoch 15`: `19.70%`
+- `epoch 20`: `22.33%`
+- `epoch 25`: `20.04%`
+- `epoch 30`: `20.69%`
+- `epoch 35`: `20.85%`
+- `epoch 40`: `21.01%`
+- `epoch 45`: `21.23%`
+- `epoch 50`: `21.39%`
+- `epoch 55`: `22.03%`
+
+Current best:
+- best observed test accuracy on this run: `22.33%` at `epoch 20`
+
+### Sigma / exploration behavior
+
+- Sigma shrank steadily during the run:
+  - `epoch 20`: `0.00492`
+  - `epoch 21`: `0.00404`
+  - `epoch 22`: `0.00331`
+  - `epoch 23`: `0.00272`
+  - `epoch 24`: `0.00223`
+  - `epoch 25`: `0.00183`
+  - `epoch 27`: `0.00123`
+  - `epoch 55`: `0.00100` (floor)
+- Raw score std also collapsed:
+  - `epoch 20`: `0.00775`
+  - `epoch 27`: `0.00049`
+  - `epoch 55`: `0.00024`
+
+Takeaway:
+- The run still learns slowly even after sigma collapses.
+- Exploration is now effectively clamped at the sigma floor.
+- This makes the current sigma adaptation rule a likely limiter for later-stage
+  progress.
+
+### Effective data exposure
+
+- At `global_update=560` and `batch_size=48`, the run has processed about
+  `26,880` sampled training examples.
+- Relative to the CIFAR-10 train set (`50,000`), this is only about
+  `0.54` effective full passes over the dataset.
+- Important reminder:
+  - logged "epoch" in this loop is **not** a full data epoch
+  - `epoch 55` here means `560` minibatch ES updates, not `55` full CIFAR passes
+
+### Updated conclusions
+
+1. The heavy CIFAR config does run and train on at least one 5090 host.
+2. The previous startup "hang" should be treated as a host/runtime issue, not a
+   universal codepath deadlock.
+3. The most expensive region is first population scoring, not dataset loading or
+   prefetch.
+4. The current heavy run is the new best-documented CIFAR run and is roughly
+   matching the earlier `21.18%` result while using the newer throughput path.
+5. Sigma collapse now looks like the main optimizer-level problem on long runs.

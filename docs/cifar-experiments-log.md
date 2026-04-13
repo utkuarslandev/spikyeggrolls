@@ -284,3 +284,208 @@ the full system is still bottlenecked by training-regime issues:
 
 The next steps should focus on the training rule and throughput, not just larger
 VRAM occupancy.
+
+## April 12 Addendum — Startup Stall Investigation and New Heavy 5090 Run
+
+### 9. Heavy 5090 startup-stall investigation across hosts
+
+#### 9a. Host that appeared to hang before training
+
+Hardware:
+- RTX 5090 32 GB
+
+Host:
+- `216.249.100.66:21657`
+
+Configs attempted:
+- `float32`, `batch_size=64`, `chunk_size=128`
+- `bfloat16`, `batch_size=48`, `chunk_size=128`
+- `bfloat16`, `batch_size=48`, `chunk_size=96`
+
+Observed behavior:
+- Process stayed alive for hours.
+- GPU stayed at about `97-99%` utilization.
+- GPU memory stayed pinned around `29.4 / 32.6 GiB`.
+- Log advanced only with JAX/XLA warnings.
+- No normal training progress appeared in the expected logs.
+
+Takeaway:
+- This looked like a startup/compile stall, not a normal slow first epoch.
+- The behavior was severe enough to justify explicit startup tracing.
+
+#### 9b. Instrumentation added for startup debugging
+
+Changes added to `spikyeggroll/train.py` and pushed to GitHub:
+- timestamped startup markers around:
+  - model init
+  - noiser init
+  - dataset load
+  - JIT wrapper creation
+  - prefetch warmup
+  - start-metric write
+  - first eval forward
+  - first population scoring step
+  - first update
+- `jax.block_until_ready(...)` on traced milestones
+- gated device-memory snapshots during startup
+- bounded startup trace capture
+- optional live profiler server
+
+Relevant commits:
+- `fc80b53` `Add startup tracing for CIFAR training hangs`
+- `b802030` `Add gated startup memory profiling`
+- `db3e1c6` `Add startup trace capture controls`
+
+#### 9c. Important logging-path discovery
+
+For direct `python -m spikyeggroll.train` runs:
+- stdout logs were being redirected to `/workspace/logs/spikyeggroll/...`
+- metrics and checkpoints were still being written to repo-relative defaults:
+  - `/workspace/spikyeggrolls/logs/spikyeggroll/...`
+  - `/workspace/spikyeggrolls/checkpoints/spikyeggroll/...`
+
+Takeaway:
+- Some early “missing metrics” conclusions were path mismatches rather than
+  proof that the run had not progressed.
+
+### 10. Heavy traced run on a second 5090 host: startup clears
+
+Hardware:
+- RTX 5090 32 GB
+
+Host:
+- `64.228.13.219:61195`
+
+Run name:
+- `cifar5090-r2-p4096-t16-c32-b48-k96-bf16-trace2-20260412`
+
+Command shape:
+```bash
+.venv/bin/python -m spikyeggroll.train \
+  --dataset cifar10 --model_name spiking_resnet18 \
+  --pop_size 4096 --rank 2 --sigma 0.006 --lr 0.0015 \
+  --epochs 300 --timesteps 16 --batch_size 48 --chunk_size 96 \
+  --augment --resnet_channels_base 32 --sigma_warmup_epochs 20 \
+  --test_interval 5 --checkpoint_interval 10 --log_interval 1 \
+  --dtype bfloat16 \
+  --run_name cifar5090-r2-p4096-t16-c32-b48-k96-bf16-trace2-20260412
+```
+
+Tracing/profiling env:
+- `SPIKYEGGROLL_TRACE_STARTUP=1`
+- `SPIKYEGGROLL_PROFILE_STARTUP=1`
+- `SPIKYEGGROLL_PROFILE_MAX_SNAPSHOTS=16`
+- `SPIKYEGGROLL_PROFILE_TRACE=1`
+- `SPIKYEGGROLL_PROFILE_SERVER_PORT=9999`
+
+Observed startup milestones:
+- `train() begin` at `16:35:39`
+- `model init complete` at `16:35:43`
+- `dataset loaded` at `16:35:47`
+- `start metric written` at `16:35:48`
+- first `jit_forward_eval` ready at `16:35:49`
+- first `population scores` ready at `16:36:15`
+- first `jit_update` ready at `16:36:18`
+- bounded startup trace stopped at `16:37:02`
+
+Approximate startup timings:
+- model init: `~3 s`
+- dataset load/download path: `~4 s`
+- prefetch warmup: `~1 s`
+- first eval forward: `~1 s`
+- first population scoring step: `~26 s`
+- first update: `~3 s`
+
+Profiler state:
+- live profiler server listening on `:9999`
+- bounded startup trace directory created
+- startup memory snapshots saved
+
+Takeaway:
+- The heavy CIFAR config is not fundamentally deadlocking.
+- The earlier “stall” was at least partly host/runtime specific.
+- The dominant startup cost is first population scoring, not dataset load or
+  prefetch.
+
+### 11. Ongoing heavy 5090 run with traced startup
+
+Hardware:
+- RTX 5090 32 GB
+
+Host:
+- `64.228.13.219:61195`
+
+Run name:
+- `cifar5090-r2-p4096-t16-c32-b48-k96-bf16-trace2-20260412`
+
+Latest checked state:
+- `epoch 55`
+- `global_update 560`
+- GPU utilization: `99%`
+- GPU memory: about `29.46 / 32.6 GiB`
+- average update time: `~21.74 s`
+- average epoch time: `~217.4 s`
+
+Test accuracy history:
+- `epoch 0`: `10.01%`
+- `epoch 5`: `12.65%`
+- `epoch 10`: `16.26%`
+- `epoch 15`: `19.70%`
+- `epoch 20`: `22.33%`
+- `epoch 25`: `20.04%`
+- `epoch 30`: `20.69%`
+- `epoch 35`: `20.85%`
+- `epoch 40`: `21.01%`
+- `epoch 45`: `21.23%`
+- `epoch 50`: `21.39%`
+- `epoch 55`: `22.03%`
+
+Best observed on this run:
+- `22.33%` at `epoch 20`
+
+Comparison to prior best:
+- This slightly exceeds the earlier documented `21.18%` best from
+  `cifar5090-r2-p4096-t16-c32-b32-k96-20260411`.
+
+### 12. Sigma / exploration behavior on the new heavy run
+
+Observed sigma collapse:
+- `epoch 20`: `0.00492`
+- `epoch 21`: `0.00404`
+- `epoch 22`: `0.00331`
+- `epoch 23`: `0.00272`
+- `epoch 24`: `0.00223`
+- `epoch 25`: `0.00183`
+- `epoch 27`: `0.00123`
+- `epoch 55`: `0.00100` (floor)
+
+Observed exploration shrinkage:
+- `raw_score_std` fell from about `0.00775` near epoch 20 to
+  `0.00024` by epoch 55
+
+Takeaway:
+- The run continues to improve slowly even after sigma collapses.
+- Exploration is now effectively clamped, so the current sigma schedule remains
+  a likely limiter for later-stage learning.
+
+### 13. Effective dataset exposure reminder
+
+At `global_update=560` with `batch_size=48`:
+- total sampled training examples: about `26,880`
+- relative to CIFAR-10 train size (`50,000`): about `0.54` effective full passes
+
+Important interpretation:
+- logged “epoch” in this training loop is not a full dataset epoch
+- `epoch 55` here means `560` minibatch ES updates, not `55` complete passes
+
+## Updated Conclusion
+
+The startup-stall investigation changed the diagnosis:
+
+- the heavy CIFAR config can run and train on at least one 5090 host
+- the earlier “hang” should be treated as host/runtime specific until proven
+  otherwise
+- the main startup cost is the first population-scoring path
+- the current best documented CIFAR result is now **22.33%**
+- the most obvious remaining optimizer issue in long runs is sigma collapsing to
+  the floor and starving exploration
