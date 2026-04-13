@@ -38,6 +38,10 @@ def _excluded_array(value):
     return CommonInit(None, value, (), EXCLUDED)
 
 
+def _tree_fill_group(tree, group: str):
+    return jax.tree_util.tree_map(lambda _: group, tree)
+
+
 def _merge_bn_stats(existing, incoming):
     if existing is None:
         return incoming
@@ -457,6 +461,7 @@ class SpikingResNet18Model(Model):
     """Convolutional CIFAR-sized spiking ResNet-18."""
 
     STAGE_BLOCKS = (2, 2, 2, 2)
+    PHASES = ("early_selective", "mid_selective", "full_model_refresh")
 
     @classmethod
     def rand_init(cls, key, cfg: SNNConfig):
@@ -525,6 +530,17 @@ class SpikingResNet18Model(Model):
                 key_idx += 1
 
         init = merge_inits(**all_inits)
+        perturb_group_map = {
+            "stem_conv": _tree_fill_group(init.params["stem_conv"], "stem"),
+            "stem_norm": _tree_fill_group(init.params["stem_norm"], "stem"),
+            "linear_out": _tree_fill_group(init.params["linear_out"], "head"),
+        }
+        for stage_idx, block_count in enumerate(stage_blocks):
+            for block_idx in range(block_count):
+                name = f"stage{stage_idx}_block{block_idx}"
+                perturb_group_map[name] = _tree_fill_group(
+                    init.params[name], f"stage{stage_idx}"
+                )
         init = merge_frozen(
             init,
             beta=cfg.beta,
@@ -539,8 +555,137 @@ class SpikingResNet18Model(Model):
             resnet_bn_momentum=cfg.resnet_bn_momentum,
             resnet_bn_eps=cfg.resnet_bn_eps,
             resnet_threshold_scale=cfg.resnet_threshold_scale,
+            perturb_group_map=perturb_group_map,
         )
         return init
+
+    @classmethod
+    def resolve_selective_plan(cls, epoch: int, num_epochs: int, cfg: SNNConfig):
+        if not cfg.selective_stage_perturbation:
+            return {
+                "phase": "disabled",
+                "active_groups": ("stem", "stage0", "stage1", "stage2", "stage3", "head"),
+                "cache_split": None,
+            }
+        if cfg.stage_perturbation_schedule != "head_last_then_last2":
+            raise ValueError(
+                f"Unsupported stage_perturbation_schedule='{cfg.stage_perturbation_schedule}'."
+            )
+        if epoch > 0 and cfg.stage_perturbation_full_epoch_interval > 0:
+            if epoch % cfg.stage_perturbation_full_epoch_interval == 0:
+                return {
+                    "phase": "full_model_refresh",
+                    "active_groups": ("stem", "stage0", "stage1", "stage2", "stage3", "head"),
+                    "cache_split": None,
+                }
+        progress = 0.0 if num_epochs <= 0 else epoch / num_epochs
+        if progress < cfg.stage_perturbation_early_fraction:
+            return {
+                "phase": "early_selective",
+                "active_groups": ("stage3", "head"),
+                "cache_split": "after_stage2",
+            }
+        return {
+            "phase": "mid_selective",
+            "active_groups": ("stage2", "stage3", "head"),
+            "cache_split": "after_stage1",
+        }
+
+    @classmethod
+    def build_active_es_map(cls, es_map, perturb_group_map, active_groups):
+        active_groups = frozenset(active_groups)
+        return jax.tree_util.tree_map(
+            lambda map_class, group: map_class
+            if map_class != EXCLUDED and group in active_groups
+            else EXCLUDED,
+            es_map,
+            perturb_group_map,
+        )
+
+    @classmethod
+    def active_param_fraction(cls, es_map, active_es_map):
+        base_leaves = jax.tree_util.tree_leaves(es_map)
+        active_leaves = jax.tree_util.tree_leaves(active_es_map)
+        total = sum(1 for leaf in base_leaves if leaf != EXCLUDED)
+        if total == 0:
+            return 0.0
+        active = sum(1 for leaf in active_leaves if leaf != EXCLUDED)
+        return active / total
+
+    @classmethod
+    def _stage_ranges(cls, stage_blocks):
+        ranges = []
+        start = 0
+        for block_count in stage_blocks:
+            stop = start + block_count
+            ranges.append((start, stop))
+            start = stop
+        return tuple(ranges)
+
+    @classmethod
+    def _initial_selected_block_states(
+        cls,
+        batch_size: int,
+        image_size: int,
+        stage_channels,
+        stage_blocks,
+        stage_start: int,
+        stage_end: int,
+        dtype=jnp.float32,
+    ):
+        states = []
+        spatial = image_size
+        for stage_idx in range(stage_start, stage_end + 1):
+            out_channels = stage_channels[stage_idx]
+            block_count = stage_blocks[stage_idx]
+            for block_idx in range(block_count):
+                stride = 2 if stage_idx > 0 and block_idx == 0 else 1
+                spatial = _conv_out_dim(spatial, 3, stride, 1)
+                shape = (batch_size, out_channels, spatial, spatial)
+                states.append(
+                    (jnp.zeros(shape, dtype=dtype), jnp.zeros(shape, dtype=dtype))
+                )
+        return tuple(states)
+
+    @classmethod
+    def _run_stage_range(
+        cls,
+        common_params: CommonParams,
+        x,
+        block_states,
+        *,
+        stage_start: int,
+        stage_end: int,
+        norm_training: bool,
+        collect_bn_stats: bool = False,
+    ):
+        stage_blocks = common_params.frozen_params["stage_blocks"]
+        state_idx = 0
+        new_states = []
+        bn_stats = {}
+        for stage_idx in range(stage_start, stage_end + 1):
+            block_count = stage_blocks[stage_idx]
+            for block_idx in range(block_count):
+                block_name = f"stage{stage_idx}_block{block_idx}"
+                block_result = call_submodule(
+                    BasicBlock,
+                    block_name,
+                    common_params,
+                    x,
+                    block_states[state_idx],
+                    norm_training=norm_training,
+                    collect_bn_stats=collect_bn_stats,
+                )
+                if collect_bn_stats:
+                    x, new_state, block_bn_stats = block_result
+                    bn_stats[block_name] = block_bn_stats
+                else:
+                    x, new_state = block_result
+                new_states.append(new_state)
+                state_idx += 1
+        if collect_bn_stats:
+            return x, tuple(new_states), bn_stats
+        return x, tuple(new_states)
 
     @classmethod
     def _initial_block_states(
@@ -586,32 +731,26 @@ class SpikingResNet18Model(Model):
             collect_bn_stats=collect_bn_stats,
         )
         stem_v, x = lif_step(stem_v, x, beta, threshold)
-
-        state_idx = 0
-        block_stats = {}
-        for stage_idx, block_count in enumerate(stage_blocks):
-            for block_idx in range(block_count):
-                block_name = f"stage{stage_idx}_block{block_idx}"
-                block_result = call_submodule(
-                    BasicBlock,
-                    block_name,
-                    common_params,
-                    x,
-                    block_states[state_idx],
-                    norm_training=norm_training,
-                    collect_bn_stats=collect_bn_stats,
-                )
-                if collect_bn_stats:
-                    x, new_state, bn_stats = block_result
-                    block_stats[block_name] = bn_stats
-                else:
-                    x, new_state = block_result
-                block_states = (
-                    block_states[:state_idx]
-                    + (new_state,)
-                    + block_states[state_idx + 1 :]
-                )
-                state_idx += 1
+        if collect_bn_stats:
+            x, block_states, block_stats = cls._run_stage_range(
+                common_params,
+                x,
+                block_states,
+                stage_start=0,
+                stage_end=len(stage_blocks) - 1,
+                norm_training=norm_training,
+                collect_bn_stats=True,
+            )
+        else:
+            x, block_states = cls._run_stage_range(
+                common_params,
+                x,
+                block_states,
+                stage_start=0,
+                stage_end=len(stage_blocks) - 1,
+                norm_training=norm_training,
+                collect_bn_stats=False,
+            )
 
         pooled = jnp.mean(x, axis=(2, 3))
         logits = call_submodule(Linear, "linear_out", common_params, pooled)
@@ -621,6 +760,68 @@ class SpikingResNet18Model(Model):
             step_stats = {"stem_norm": stem_bn_stats, **block_stats}
             return (stem_v, block_states, classifier_v, acc), step_stats
         return (stem_v, block_states, classifier_v, acc), None
+
+    @classmethod
+    def _prefix_scan_step(
+        cls,
+        common_params: CommonParams,
+        carry,
+        x_t,
+        *,
+        prefix_end_stage: int,
+        norm_training: bool,
+    ):
+        beta = common_params.frozen_params["beta"]
+        threshold = common_params.frozen_params["threshold"]
+        stem_v, prefix_block_states = carry
+
+        x = call_submodule(Conv2d, "stem_conv", common_params, x_t)
+        x, _ = _apply_norm(
+            common_params,
+            "stem_norm",
+            x,
+            norm_training=norm_training,
+            collect_bn_stats=False,
+        )
+        stem_v, x = lif_step(stem_v, x, beta, threshold)
+        x, prefix_block_states = cls._run_stage_range(
+            common_params,
+            x,
+            prefix_block_states,
+            stage_start=0,
+            stage_end=prefix_end_stage,
+            norm_training=norm_training,
+            collect_bn_stats=False,
+        )
+        return (stem_v, prefix_block_states), x
+
+    @classmethod
+    def _suffix_scan_step(
+        cls,
+        common_params: CommonParams,
+        carry,
+        x_t,
+        *,
+        suffix_start_stage: int,
+        norm_training: bool,
+    ):
+        beta = common_params.frozen_params["beta"]
+        use_membrane = common_params.frozen_params["membrane_readout"]
+        suffix_block_states, classifier_v, acc = carry
+        x, suffix_block_states = cls._run_stage_range(
+            common_params,
+            x_t,
+            suffix_block_states,
+            stage_start=suffix_start_stage,
+            stage_end=len(common_params.frozen_params["stage_blocks"]) - 1,
+            norm_training=norm_training,
+            collect_bn_stats=False,
+        )
+        pooled = jnp.mean(x, axis=(2, 3))
+        logits = call_submodule(Linear, "linear_out", common_params, pooled)
+        classifier_v = beta * classifier_v + logits
+        acc = acc + (classifier_v if use_membrane else logits)
+        return (suffix_block_states, classifier_v, acc), None
 
     @classmethod
     def _forward(
@@ -669,6 +870,208 @@ class SpikingResNet18Model(Model):
         if collect_bn_stats:
             return acc, _mean_bn_stats(step_stats)
         return acc
+
+    @classmethod
+    def _forward_prefix(
+        cls,
+        common_params: CommonParams,
+        x,
+        *,
+        prefix_end_stage: int,
+        norm_training: bool,
+    ):
+        if x.ndim != 5:
+            raise ValueError(
+                f"spiking_resnet18 expects input shape [B, T, C, H, W], got {x.shape}."
+            )
+        model_dtype = common_params.params["stem_conv"]["weight"].dtype
+        batch_size, timesteps, _, image_size, _ = x.shape
+        stage_channels = common_params.frozen_params["stage_channels"]
+        stage_blocks = common_params.frozen_params["stage_blocks"]
+        stem_v = jnp.zeros(
+            (batch_size, stage_channels[0], image_size, image_size), dtype=model_dtype
+        )
+        prefix_block_states = cls._initial_selected_block_states(
+            batch_size,
+            image_size,
+            stage_channels,
+            stage_blocks,
+            stage_start=0,
+            stage_end=prefix_end_stage,
+            dtype=model_dtype,
+        )
+        x_t = jnp.transpose(x.astype(model_dtype), (1, 0, 2, 3, 4))
+        (_, _), prefix_steps = jax.lax.scan(
+            lambda carry, step_x: cls._prefix_scan_step(
+                common_params,
+                carry,
+                step_x,
+                prefix_end_stage=prefix_end_stage,
+                norm_training=norm_training,
+            ),
+            (stem_v, prefix_block_states),
+            x_t,
+        )
+        return jnp.transpose(prefix_steps, (1, 0, 2, 3, 4))
+
+    @classmethod
+    def _forward_suffix(
+        cls,
+        common_params: CommonParams,
+        cached_x,
+        *,
+        suffix_start_stage: int,
+        norm_training: bool,
+    ):
+        if cached_x.ndim != 5:
+            raise ValueError(
+                f"spiking_resnet18 expects cached input shape [B, T, C, H, W], got {cached_x.shape}."
+            )
+        model_dtype = common_params.params["linear_out"]["weight"].dtype
+        batch_size, timesteps, _, image_size, _ = cached_x.shape
+        stage_channels = common_params.frozen_params["stage_channels"]
+        stage_blocks = common_params.frozen_params["stage_blocks"]
+        suffix_block_states = cls._initial_selected_block_states(
+            batch_size,
+            image_size,
+            stage_channels,
+            stage_blocks,
+            stage_start=suffix_start_stage,
+            stage_end=len(stage_blocks) - 1,
+            dtype=model_dtype,
+        )
+        classifier_v = jnp.zeros(
+            (batch_size, common_params.params["linear_out"]["weight"].shape[0]),
+            dtype=model_dtype,
+        )
+        acc = jnp.zeros_like(classifier_v)
+        cached_t = jnp.transpose(cached_x.astype(model_dtype), (1, 0, 2, 3, 4))
+        (_, _, acc), _ = jax.lax.scan(
+            lambda carry, step_x: cls._suffix_scan_step(
+                common_params,
+                carry,
+                step_x,
+                suffix_start_stage=suffix_start_stage,
+                norm_training=norm_training,
+            ),
+            (suffix_block_states, classifier_v, acc),
+            cached_t,
+        )
+        return acc / timesteps
+
+    @classmethod
+    def forward_prefix_after_stage1(
+        cls,
+        noiser,
+        frozen_noiser_params,
+        noiser_params,
+        frozen_params,
+        params,
+        es_tree_key,
+        x,
+        *,
+        norm_training: bool,
+    ):
+        return cls._forward_prefix(
+            CommonParams(
+                noiser,
+                frozen_noiser_params,
+                noiser_params,
+                frozen_params,
+                params,
+                es_tree_key,
+                None,
+            ),
+            x,
+            prefix_end_stage=1,
+            norm_training=norm_training,
+        )
+
+    @classmethod
+    def forward_prefix_after_stage2(
+        cls,
+        noiser,
+        frozen_noiser_params,
+        noiser_params,
+        frozen_params,
+        params,
+        es_tree_key,
+        x,
+        *,
+        norm_training: bool,
+    ):
+        return cls._forward_prefix(
+            CommonParams(
+                noiser,
+                frozen_noiser_params,
+                noiser_params,
+                frozen_params,
+                params,
+                es_tree_key,
+                None,
+            ),
+            x,
+            prefix_end_stage=2,
+            norm_training=norm_training,
+        )
+
+    @classmethod
+    def forward_suffix_after_stage1(
+        cls,
+        noiser,
+        frozen_noiser_params,
+        noiser_params,
+        frozen_params,
+        params,
+        es_tree_key,
+        iterinfo,
+        cached_x,
+        *,
+        norm_training: bool,
+    ):
+        return cls._forward_suffix(
+            CommonParams(
+                noiser,
+                frozen_noiser_params,
+                noiser_params,
+                frozen_params,
+                params,
+                es_tree_key,
+                iterinfo,
+            ),
+            cached_x,
+            suffix_start_stage=2,
+            norm_training=norm_training,
+        )
+
+    @classmethod
+    def forward_suffix_after_stage2(
+        cls,
+        noiser,
+        frozen_noiser_params,
+        noiser_params,
+        frozen_params,
+        params,
+        es_tree_key,
+        iterinfo,
+        cached_x,
+        *,
+        norm_training: bool,
+    ):
+        return cls._forward_suffix(
+            CommonParams(
+                noiser,
+                frozen_noiser_params,
+                noiser_params,
+                frozen_params,
+                params,
+                es_tree_key,
+                iterinfo,
+            ),
+            cached_x,
+            suffix_start_stage=3,
+            norm_training=norm_training,
+        )
 
     @classmethod
     def forward_train_with_bn_stats(

@@ -220,6 +220,28 @@ def test_cli_profile_flags_roundtrip():
     assert cfg.sigma_ema_decay == pytest.approx(0.85)
 
 
+def test_cli_selective_stage_perturbation_flags_roundtrip():
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--selective_stage_perturbation",
+            "--stage_perturbation_schedule",
+            "head_last_then_last2",
+            "--stage_perturbation_early_fraction",
+            "0.4",
+            "--stage_perturbation_full_epoch_interval",
+            "6",
+        ]
+    )
+
+    cfg = build_config_from_args(args)
+
+    assert cfg.selective_stage_perturbation is True
+    assert cfg.stage_perturbation_schedule == "head_last_then_last2"
+    assert cfg.stage_perturbation_early_fraction == pytest.approx(0.4)
+    assert cfg.stage_perturbation_full_epoch_interval == 6
+
+
 def test_cli_rejects_removed_legacy_resnet_flags():
     parser = build_parser()
     with pytest.raises(SystemExit):
@@ -467,3 +489,80 @@ def test_train_steady_state_profile_window_and_paths(monkeypatch, tmp_path):
     assert "timing_population_score_frac" in epoch_record
     assert (tmp_path / "logs" / "pytest-profile-steady.profile-summary.json").exists()
     assert (tmp_path / "ckpts").exists()
+
+
+def test_train_selective_stage_perturbation_emits_metrics(monkeypatch, tmp_path):
+    def loader():
+        train_images = jnp.linspace(
+            0.0, 1.0, 8 * 32 * 32 * 3, dtype=jnp.float32
+        ).reshape(8, 32, 32, 3)
+        train_labels = (jnp.arange(8) % 10).astype(jnp.int32)
+        test_images = train_images[:4]
+        test_labels = train_labels[:4]
+        return train_images, train_labels, test_images, test_labels
+
+    def encoder(images, timesteps, key):
+        del key
+        spikes = (images > 0.5).astype(jnp.float32)
+        return jnp.broadcast_to(
+            jnp.transpose(spikes, (0, 3, 1, 2))[:, None, :, :, :],
+            (images.shape[0], timesteps, 3, 32, 32),
+        )
+
+    monkeypatch.setattr(
+        "spikyeggroll.train.get_dataset_spec",
+        lambda cfg: DatasetSpec(
+            loader=loader,
+            encoder=encoder,
+            n_inputs=3072,
+            in_channels=3,
+            image_size=32,
+        ),
+    )
+
+    cfg = SNNConfig(
+        dataset="cifar10",
+        model_name="spiking_resnet18",
+        n_inputs=3072,
+        in_channels=3,
+        image_size=32,
+        n_classes=10,
+        timesteps=2,
+        pop_size=4,
+        rank=1,
+        sigma=0.01,
+        sigma_min=0.0025,
+        sigma_max=0.012,
+        lr=0.001,
+        batch_size=2,
+        chunk_size=2,
+        num_epochs=2,
+        updates_per_epoch=1,
+        sigma_warmup_epochs=0,
+        log_interval=1,
+        test_interval=0,
+        checkpoint_interval=0,
+        run_name="pytest-selective-cifar",
+        log_dir=str(tmp_path / "logs"),
+        checkpoint_dir=str(tmp_path / "ckpts"),
+        resnet_channels_base=8,
+        selective_stage_perturbation=True,
+        stage_perturbation_early_fraction=0.5,
+        stage_perturbation_full_epoch_interval=8,
+    )
+
+    train(cfg)
+
+    metrics_path = tmp_path / "logs" / "pytest-selective-cifar.metrics.jsonl"
+    records = [json.loads(line) for line in metrics_path.read_text().splitlines() if line.strip()]
+    epoch_records = [r for r in records if r["event"] == "epoch"]
+
+    assert len(epoch_records) == 2
+    assert epoch_records[0]["selective_stage_perturbation"] is True
+    assert epoch_records[0]["perturbation_phase"] == "early_selective"
+    assert epoch_records[0]["cache_split"] == "after_stage2"
+    assert epoch_records[0]["active_stage_groups"] == ["stage3", "head"]
+    assert epoch_records[0]["active_param_fraction"] < 1.0
+    assert epoch_records[1]["perturbation_phase"] == "mid_selective"
+    assert epoch_records[1]["cache_split"] == "after_stage1"
+    assert epoch_records[1]["active_stage_groups"] == ["stage2", "stage3", "head"]

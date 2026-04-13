@@ -77,3 +77,7 @@ def test_cifar_model_defaults_reflect_debug_baseline_architecture():
     assert cfg.profile_updates_window == 3
     assert cfg.profile_eval_once is False
     assert cfg.profile_sync_timings is True
+    assert cfg.selective_stage_perturbation is False
+    assert cfg.stage_perturbation_schedule == "head_last_then_last2"
+    assert cfg.stage_perturbation_early_fraction == pytest.approx(0.30)
+    assert cfg.stage_perturbation_full_epoch_interval == 8

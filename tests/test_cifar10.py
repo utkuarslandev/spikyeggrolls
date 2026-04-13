@@ -5,7 +5,7 @@ import jax
 import jax.numpy as jnp
 
 from hyperscalees.models.base_model import CommonParams
-from hyperscalees.models.common import ConvKernel, simple_es_tree_key
+from hyperscalees.models.common import ConvKernel, EXCLUDED, simple_es_tree_key
 from hyperscalees.noiser.eggroll import EggRoll
 from spikyeggroll.data.cifar10 import augment_batch, encode_batch
 from spikyeggroll.configs import SNNConfig
@@ -481,6 +481,199 @@ def test_batchnorm_running_stats_update_only_from_base_forward():
 
     assert jnp.allclose(before_noisy_mean, updated_params["stem_norm"]["running_mean"])
     assert jnp.allclose(before_noisy_var, updated_params["stage0_block0"]["norm1"]["running_var"])
+
+
+def test_selective_plan_schedule_resolves_early_mid_and_full_refresh():
+    cfg = SNNConfig(
+        dataset="cifar10",
+        model_name="spiking_resnet18",
+        num_epochs=10,
+        selective_stage_perturbation=True,
+        stage_perturbation_early_fraction=0.3,
+        stage_perturbation_full_epoch_interval=8,
+    )
+
+    early = SpikingResNet18Model.resolve_selective_plan(2, cfg.num_epochs, cfg)
+    mid = SpikingResNet18Model.resolve_selective_plan(4, cfg.num_epochs, cfg)
+    full = SpikingResNet18Model.resolve_selective_plan(8, cfg.num_epochs, cfg)
+
+    assert early["phase"] == "early_selective"
+    assert early["active_groups"] == ("stage3", "head")
+    assert early["cache_split"] == "after_stage2"
+    assert mid["phase"] == "mid_selective"
+    assert mid["active_groups"] == ("stage2", "stage3", "head")
+    assert mid["cache_split"] == "after_stage1"
+    assert full["phase"] == "full_model_refresh"
+    assert full["cache_split"] is None
+    assert full["active_groups"] == (
+        "stem",
+        "stage0",
+        "stage1",
+        "stage2",
+        "stage3",
+        "head",
+    )
+
+
+def test_selective_es_map_masks_inactive_groups_and_keeps_bn_stats_excluded():
+    key = jax.random.key(101)
+    cfg = SNNConfig(
+        dataset="cifar10",
+        model_name="spiking_resnet18",
+        resnet_norm="batch",
+    )
+    frozen_params, _, _, es_map = SpikingResNet18Model.rand_init(key, cfg)
+    perturb_group_map = frozen_params["perturb_group_map"]
+
+    early_map = SpikingResNet18Model.build_active_es_map(
+        es_map, perturb_group_map, ("stage3", "head")
+    )
+    mid_map = SpikingResNet18Model.build_active_es_map(
+        es_map, perturb_group_map, ("stage2", "stage3", "head")
+    )
+    full_map = SpikingResNet18Model.build_active_es_map(
+        es_map, perturb_group_map, ("stem", "stage0", "stage1", "stage2", "stage3", "head")
+    )
+
+    assert early_map["stem_conv"]["weight"] == EXCLUDED
+    assert early_map["stage2_block0"]["conv1"]["weight"] == EXCLUDED
+    assert early_map["stage3_block0"]["conv1"]["weight"] != EXCLUDED
+    assert early_map["linear_out"]["weight"] != EXCLUDED
+    assert early_map["stem_norm"]["running_mean"] == EXCLUDED
+    assert early_map["stage3_block0"]["norm1"]["running_var"] == EXCLUDED
+
+    assert mid_map["stage2_block0"]["conv1"]["weight"] != EXCLUDED
+    assert mid_map["stage1_block0"]["conv1"]["weight"] == EXCLUDED
+
+    assert full_map["stem_conv"]["weight"] == es_map["stem_conv"]["weight"]
+    assert full_map["stage1_block0"]["conv1"]["weight"] == es_map["stage1_block0"]["conv1"]["weight"]
+
+
+@pytest.mark.parametrize("resnet_norm", ["group", "batch"])
+def test_prefix_suffix_forward_matches_full_forward_after_stage1_and_stage2(resnet_norm):
+    key = jax.random.key(102)
+    k1, k2, k3 = jax.random.split(key, 3)
+    cfg = SNNConfig(
+        dataset="cifar10",
+        model_name="spiking_resnet18",
+        timesteps=3,
+        pop_size=4,
+        resnet_norm=resnet_norm,
+    )
+    frozen_params, params, es_tree_key, frozen_noiser_params, noiser_params = _init_resnet(
+        cfg, k1
+    )
+    x = jax.random.bernoulli(k3, 0.3, (2, 3, 3, 32, 32)).astype(jnp.float32)
+
+    common_kwargs = {}
+    if resnet_norm == "batch":
+        _, params = _updated_batchnorm_params(
+            cfg, frozen_params, params, es_tree_key, frozen_noiser_params, noiser_params, x
+        )
+        common_kwargs["norm_training"] = False
+
+    full = SpikingResNet18Model.forward(
+        EggRoll,
+        frozen_noiser_params,
+        noiser_params,
+        frozen_params,
+        params,
+        es_tree_key,
+        None,
+        x,
+        **common_kwargs,
+    )
+    prefix_stage1 = SpikingResNet18Model.forward_prefix_after_stage1(
+        EggRoll,
+        frozen_noiser_params,
+        noiser_params,
+        frozen_params,
+        params,
+        es_tree_key,
+        x,
+        norm_training=common_kwargs.get("norm_training", False),
+    )
+    suffix_stage1 = SpikingResNet18Model.forward_suffix_after_stage1(
+        EggRoll,
+        frozen_noiser_params,
+        noiser_params,
+        frozen_params,
+        params,
+        es_tree_key,
+        None,
+        prefix_stage1,
+        norm_training=common_kwargs.get("norm_training", False),
+    )
+    prefix_stage2 = SpikingResNet18Model.forward_prefix_after_stage2(
+        EggRoll,
+        frozen_noiser_params,
+        noiser_params,
+        frozen_params,
+        params,
+        es_tree_key,
+        x,
+        norm_training=common_kwargs.get("norm_training", False),
+    )
+    suffix_stage2 = SpikingResNet18Model.forward_suffix_after_stage2(
+        EggRoll,
+        frozen_noiser_params,
+        noiser_params,
+        frozen_params,
+        params,
+        es_tree_key,
+        None,
+        prefix_stage2,
+        norm_training=common_kwargs.get("norm_training", False),
+    )
+
+    assert jnp.allclose(full, suffix_stage1, atol=1e-5, rtol=1e-5)
+    assert jnp.allclose(full, suffix_stage2, atol=1e-5, rtol=1e-5)
+
+
+def test_selective_update_changes_only_active_stages():
+    key = jax.random.key(103)
+    k1, k2 = jax.random.split(key)
+    cfg = SNNConfig(
+        dataset="cifar10",
+        model_name="spiking_resnet18",
+        timesteps=3,
+        pop_size=4,
+        rank=1,
+    )
+    frozen_params, params, scan_map, es_map = SpikingResNet18Model.rand_init(k1, cfg)
+    es_tree_key = simple_es_tree_key(params, k2, scan_map)
+    frozen_noiser_params, noiser_params = EggRoll.init_noiser(
+        params, cfg.sigma, cfg.lr, rank=cfg.rank
+    )
+    active_es_map = SpikingResNet18Model.build_active_es_map(
+        es_map, frozen_params["perturb_group_map"], ("stage3", "head")
+    )
+    iterinfo = (jnp.zeros(cfg.pop_size, dtype=jnp.int32), jnp.arange(cfg.pop_size))
+    fitnesses = jnp.array([1.0, -1.0, 0.5, -0.5], dtype=jnp.float32)
+
+    _, new_params = EggRoll.do_updates(
+        frozen_noiser_params,
+        noiser_params,
+        params,
+        es_tree_key,
+        fitnesses,
+        iterinfo,
+        active_es_map,
+    )
+
+    assert jnp.allclose(new_params["stem_conv"]["weight"], params["stem_conv"]["weight"])
+    assert jnp.allclose(
+        new_params["stage2_block0"]["conv1"]["weight"],
+        params["stage2_block0"]["conv1"]["weight"],
+    )
+    assert not jnp.allclose(
+        new_params["stage3_block0"]["conv1"]["weight"],
+        params["stage3_block0"]["conv1"]["weight"],
+    )
+    assert not jnp.allclose(
+        new_params["linear_out"]["weight"],
+        params["linear_out"]["weight"],
+    )
 
 
 def test_augment_batch_shape_and_range():

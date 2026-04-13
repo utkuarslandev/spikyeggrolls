@@ -397,6 +397,7 @@ class ProfilingController:
         }
         for stage in [
             "sample_encode_s",
+            "prefix_cache_s",
             "forward_eval_s",
             "population_score_s",
             "update_s",
@@ -439,6 +440,7 @@ class ProfilingController:
             "population_score_s",
             "update_s",
             "sample_encode_s",
+            "prefix_cache_s",
             "forward_eval_s",
         ]:
             summary = stage_summary.get(stage)
@@ -626,6 +628,13 @@ def train(cfg: SNNConfig = None):
         f"grow={cfg.sigma_growth:.3f} decay={cfg.sigma_decay:.3f} "
         f"ema={cfg.sigma_ema_decay:.3f} clip=[{cfg.sigma_min:.4f}, {cfg.sigma_max:.4f}]"
     )
+    print(
+        "Selective perturbation: "
+        f"enabled={cfg.selective_stage_perturbation} "
+        f"schedule={cfg.stage_perturbation_schedule} "
+        f"early_fraction={cfg.stage_perturbation_early_fraction:.2f} "
+        f"full_interval={cfg.stage_perturbation_full_epoch_interval}"
+    )
     total_updates = cfg.num_epochs * cfg.updates_per_epoch
     total_samples = total_updates * cfg.batch_size
     if cfg.dataset == "cifar10":
@@ -732,6 +741,125 @@ def train(cfg: SNNConfig = None):
         )
         jit_forward_train_with_bn_stats = None
 
+    selective_supported = (
+        cfg.selective_stage_perturbation and cfg.model_name == "spiking_resnet18"
+    )
+    selective_phase_info = {}
+    if selective_supported:
+        perturb_group_map = frozen_params["perturb_group_map"]
+        for phase in model_cls.PHASES:
+            plan = {
+                "early_selective": model_cls.resolve_selective_plan(
+                    0, cfg.num_epochs, cfg
+                ),
+                "mid_selective": {
+                    "phase": "mid_selective",
+                    "active_groups": ("stage2", "stage3", "head"),
+                    "cache_split": "after_stage1",
+                },
+                "full_model_refresh": {
+                    "phase": "full_model_refresh",
+                    "active_groups": (
+                        "stem",
+                        "stage0",
+                        "stage1",
+                        "stage2",
+                        "stage3",
+                        "head",
+                    ),
+                    "cache_split": None,
+                },
+            }[phase]
+            active_es_map = model_cls.build_active_es_map(
+                es_map, perturb_group_map, plan["active_groups"]
+            )
+            selective_phase_info[phase] = {
+                **plan,
+                "active_es_map": active_es_map,
+                "active_param_fraction": model_cls.active_param_fraction(
+                    es_map, active_es_map
+                ),
+            }
+
+        jit_prefix_after_stage1 = jax.jit(
+            lambda n, p, x: model_cls.forward_prefix_after_stage1(
+                EggRoll,
+                frozen_noiser_params,
+                n,
+                frozen_params,
+                p,
+                es_tree_key,
+                x,
+                norm_training=True,
+            )
+        )
+        jit_prefix_after_stage2 = jax.jit(
+            lambda n, p, x: model_cls.forward_prefix_after_stage2(
+                EggRoll,
+                frozen_noiser_params,
+                n,
+                frozen_params,
+                p,
+                es_tree_key,
+                x,
+                norm_training=True,
+            )
+        )
+        jit_forward_selective_after_stage1 = jax.jit(
+            jax.vmap(
+                lambda n, p, i, prefix_x: model_cls.forward_suffix_after_stage1(
+                    EggRoll,
+                    frozen_noiser_params,
+                    n,
+                    frozen_params,
+                    p,
+                    es_tree_key,
+                    i,
+                    prefix_x,
+                    norm_training=True,
+                ),
+                in_axes=(None, None, 0, None),
+            )
+        )
+        jit_forward_selective_after_stage2 = jax.jit(
+            jax.vmap(
+                lambda n, p, i, prefix_x: model_cls.forward_suffix_after_stage2(
+                    EggRoll,
+                    frozen_noiser_params,
+                    n,
+                    frozen_params,
+                    p,
+                    es_tree_key,
+                    i,
+                    prefix_x,
+                    norm_training=True,
+                ),
+                in_axes=(None, None, 0, None),
+            )
+        )
+
+        jit_update_selective = {
+            phase: jax.jit(
+                lambda n, p, f, i, active_es_map=phase_info["active_es_map"]: EggRoll.do_updates(
+                    frozen_noiser_params,
+                    n,
+                    p,
+                    es_tree_key,
+                    f,
+                    i,
+                    active_es_map,
+                ),
+                donate_argnums=(0, 1),
+            )
+            for phase, phase_info in selective_phase_info.items()
+        }
+    else:
+        jit_prefix_after_stage1 = None
+        jit_prefix_after_stage2 = None
+        jit_forward_selective_after_stage1 = None
+        jit_forward_selective_after_stage2 = None
+        jit_update_selective = {}
+
     # JIT-compiled parameter update
     jit_update = jax.jit(
         lambda n, p, f, i: EggRoll.do_updates(
@@ -761,6 +889,26 @@ def train(cfg: SNNConfig = None):
         pop_out = jit_forward(noiser_params, params, iterinfo, x, l1b)
         return jax.vmap(compute_fitness, in_axes=(0, None))(pop_out, y)
 
+    if selective_supported:
+
+        @jax.jit
+        def score_population_selective_after_stage1_full(
+            noiser_params, params, iterinfo, prefix_x, y
+        ):
+            pop_out = jit_forward_selective_after_stage1(
+                noiser_params, params, iterinfo, prefix_x
+            )
+            return jax.vmap(compute_fitness, in_axes=(0, None))(pop_out, y)
+
+        @jax.jit
+        def score_population_selective_after_stage2_full(
+            noiser_params, params, iterinfo, prefix_x, y
+        ):
+            pop_out = jit_forward_selective_after_stage2(
+                noiser_params, params, iterinfo, prefix_x
+            )
+            return jax.vmap(compute_fitness, in_axes=(0, None))(pop_out, y)
+
     if _chunk_starts is not None:
 
         @jax.jit
@@ -777,6 +925,42 @@ def train(cfg: SNNConfig = None):
                 return score_population_full(noiser_params, params, c_iter, x, l1b, y)
 
             return jax.lax.map(score_chunk, _chunk_starts).reshape(-1)[:N]
+
+        if selective_supported:
+
+            @jax.jit
+            def score_population_selective_after_stage1_chunked(
+                noiser_params, params, epoch_ids, thread_ids, prefix_x, y
+            ):
+                if _score_pad:
+                    epoch_ids = jnp.pad(epoch_ids, (0, _score_pad), mode="edge")
+                    thread_ids = jnp.pad(thread_ids, (0, _score_pad), mode="edge")
+
+                def score_chunk(start):
+                    idx = jnp.arange(_chunk_size, dtype=jnp.int32) + start
+                    c_iter = (epoch_ids[idx], thread_ids[idx])
+                    return score_population_selective_after_stage1_full(
+                        noiser_params, params, c_iter, prefix_x, y
+                    )
+
+                return jax.lax.map(score_chunk, _chunk_starts).reshape(-1)[:N]
+
+            @jax.jit
+            def score_population_selective_after_stage2_chunked(
+                noiser_params, params, epoch_ids, thread_ids, prefix_x, y
+            ):
+                if _score_pad:
+                    epoch_ids = jnp.pad(epoch_ids, (0, _score_pad), mode="edge")
+                    thread_ids = jnp.pad(thread_ids, (0, _score_pad), mode="edge")
+
+                def score_chunk(start):
+                    idx = jnp.arange(_chunk_size, dtype=jnp.int32) + start
+                    c_iter = (epoch_ids[idx], thread_ids[idx])
+                    return score_population_selective_after_stage2_full(
+                        noiser_params, params, c_iter, prefix_x, y
+                    )
+
+                return jax.lax.map(score_chunk, _chunk_starts).reshape(-1)[:N]
     profiler.log_startup("jit wrappers ready")
 
     def eval_test():
@@ -897,6 +1081,18 @@ def train(cfg: SNNConfig = None):
             profiler.log_startup(f"epoch {epoch} begin", epoch=epoch, global_update=global_update)
             epoch_timings = defaultdict(list)
             eval_stats = None
+            selective_plan = None
+            perturbation_phase = "disabled"
+            active_stage_groups = ()
+            cache_split = None
+            active_param_fraction = 1.0
+            if selective_supported:
+                resolved_plan = model_cls.resolve_selective_plan(epoch, cfg.num_epochs, cfg)
+                perturbation_phase = resolved_plan["phase"]
+                selective_plan = selective_phase_info[perturbation_phase]
+                active_stage_groups = selective_plan["active_groups"]
+                cache_split = selective_plan["cache_split"]
+                active_param_fraction = selective_plan["active_param_fraction"]
             for _ in range(cfg.updates_per_epoch):
                 profiler.maybe_start_steady_state_trace(global_update, epoch=epoch)
                 update_start = time.perf_counter()
@@ -948,8 +1144,85 @@ def train(cfg: SNNConfig = None):
                 if "linear1" in params:
                     l1_base = compute_l1_base(params, x_batch)
 
+                prefix_cache = None
+                prefix_cache_s = 0.0
+                if selective_supported and cache_split is not None:
+                    if cache_split == "after_stage1":
+                        prefix_cache, prefix_cache_s = profiler.stage_timed_call(
+                            "prefix_cache_s",
+                            lambda: jit_prefix_after_stage1(noiser_params, params, x_batch),
+                            epoch=epoch,
+                            global_update=global_update,
+                        )
+                    else:
+                        prefix_cache, prefix_cache_s = profiler.stage_timed_call(
+                            "prefix_cache_s",
+                            lambda: jit_prefix_after_stage2(noiser_params, params, x_batch),
+                            epoch=epoch,
+                            global_update=global_update,
+                        )
+                    epoch_timings["prefix_cache_s"].append(prefix_cache_s)
+
                 # Evaluate population (with noise)
-                if _chunk_starts is not None:
+                if selective_supported and cache_split == "after_stage1":
+                    profiler.log_startup(
+                        "score_population_selective_after_stage1 begin",
+                        epoch=epoch,
+                        global_update=global_update,
+                    )
+                    if _chunk_starts is not None:
+                        raw_scores, population_score_s = profiler.stage_timed_call(
+                            "population_score_s",
+                            lambda: score_population_selective_after_stage1_chunked(
+                                noiser_params,
+                                params,
+                                iterinfo[0],
+                                iterinfo[1],
+                                prefix_cache,
+                                y_batch,
+                            ),
+                            epoch=epoch,
+                            global_update=global_update,
+                        )
+                    else:
+                        raw_scores, population_score_s = profiler.stage_timed_call(
+                            "population_score_s",
+                            lambda: score_population_selective_after_stage1_full(
+                                noiser_params, params, iterinfo, prefix_cache, y_batch
+                            ),
+                            epoch=epoch,
+                            global_update=global_update,
+                        )
+                elif selective_supported and cache_split == "after_stage2":
+                    profiler.log_startup(
+                        "score_population_selective_after_stage2 begin",
+                        epoch=epoch,
+                        global_update=global_update,
+                    )
+                    if _chunk_starts is not None:
+                        raw_scores, population_score_s = profiler.stage_timed_call(
+                            "population_score_s",
+                            lambda: score_population_selective_after_stage2_chunked(
+                                noiser_params,
+                                params,
+                                iterinfo[0],
+                                iterinfo[1],
+                                prefix_cache,
+                                y_batch,
+                            ),
+                            epoch=epoch,
+                            global_update=global_update,
+                        )
+                    else:
+                        raw_scores, population_score_s = profiler.stage_timed_call(
+                            "population_score_s",
+                            lambda: score_population_selective_after_stage2_full(
+                                noiser_params, params, iterinfo, prefix_cache, y_batch
+                            ),
+                            epoch=epoch,
+                            global_update=global_update,
+                        )
+                elif _chunk_starts is not None:
                     profiler.log_startup("score_population_chunked begin", epoch=epoch, global_update=global_update)
                     raw_scores, population_score_s = profiler.stage_timed_call(
                         "population_score_s",
@@ -990,7 +1263,13 @@ def train(cfg: SNNConfig = None):
                 profiler.log_startup("jit_update begin", epoch=epoch, global_update=global_update)
                 (noiser_params, params), update_s = profiler.stage_timed_call(
                     "update_s",
-                    lambda: jit_update(noiser_params, params, fitnesses, iterinfo),
+                    lambda: (
+                        jit_update_selective[perturbation_phase](
+                            noiser_params, params, fitnesses, iterinfo
+                        )
+                        if selective_supported
+                        else jit_update(noiser_params, params, fitnesses, iterinfo)
+                    ),
                     ready_value=lambda result: result[1],
                     epoch=epoch,
                     global_update=global_update,
@@ -1083,6 +1362,11 @@ def train(cfg: SNNConfig = None):
                 "success_rate": success_rate,
                 "ema_success": float(ema_success),
                 "sigma_action": sigma_action,
+                "selective_stage_perturbation": selective_supported,
+                "perturbation_phase": perturbation_phase,
+                "active_stage_groups": list(active_stage_groups),
+                "cache_split": cache_split,
+                "active_param_fraction": active_param_fraction,
                 **output_activity,
                 "test_acc": test_acc,
                 "timestamp": time.time(),
@@ -1225,6 +1509,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resnet_bn_momentum", type=float, default=None)
     parser.add_argument("--resnet_bn_eps", type=float, default=None)
     parser.add_argument("--resnet_threshold_scale", action="store_true", help="Scale threshold by 2**stage_idx per stage")
+    parser.add_argument(
+        "--selective_stage_perturbation",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--stage_perturbation_schedule",
+        type=str,
+        default=None,
+        choices=["head_last_then_last2"],
+    )
+    parser.add_argument("--stage_perturbation_early_fraction", type=float, default=None)
+    parser.add_argument("--stage_perturbation_full_epoch_interval", type=int, default=None)
     parser.add_argument("--pop_size", type=int, default=None)
     parser.add_argument("--rank", type=int, default=None)
     parser.add_argument("--sigma", type=float, default=None)
@@ -1329,6 +1626,26 @@ def build_config_from_args(args) -> SNNConfig:
             else base_cfg.resnet_bn_eps
         ),
         resnet_threshold_scale=args.resnet_threshold_scale,
+        selective_stage_perturbation=(
+            args.selective_stage_perturbation
+            if args.selective_stage_perturbation is not None
+            else base_cfg.selective_stage_perturbation
+        ),
+        stage_perturbation_schedule=(
+            args.stage_perturbation_schedule
+            if args.stage_perturbation_schedule is not None
+            else base_cfg.stage_perturbation_schedule
+        ),
+        stage_perturbation_early_fraction=(
+            args.stage_perturbation_early_fraction
+            if args.stage_perturbation_early_fraction is not None
+            else base_cfg.stage_perturbation_early_fraction
+        ),
+        stage_perturbation_full_epoch_interval=(
+            args.stage_perturbation_full_epoch_interval
+            if args.stage_perturbation_full_epoch_interval is not None
+            else base_cfg.stage_perturbation_full_epoch_interval
+        ),
         n_classes=base_cfg.n_classes,
         timesteps=args.timesteps if args.timesteps is not None else base_cfg.timesteps,
         pop_size=args.pop_size if args.pop_size is not None else base_cfg.pop_size,

@@ -76,6 +76,10 @@ class SNNConfig:
     resnet_bn_momentum: float = 0.9
     resnet_bn_eps: float = 1e-5
     resnet_threshold_scale: bool = False  # if True, stage i uses threshold * 2**i
+    selective_stage_perturbation: bool = False
+    stage_perturbation_schedule: str = "head_last_then_last2"
+    stage_perturbation_early_fraction: float = 0.30
+    stage_perturbation_full_epoch_interval: int = 8
 
     # Run artifacts
     run_name: str = "default"
