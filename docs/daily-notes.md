@@ -8,7 +8,7 @@ Use it for:
 - implementation milestones as they happened
 
 For the current CIFAR/ResNet state, active baseline, and next actions, see
-[docs/cifar-experiments-log.md](docs/cifar-experiments-log.md).
+[experiments/cifar.md](experiments/cifar.md).
 
 ## March 31 — Project Bootstrap & Initial Benchmarks
 
@@ -271,286 +271,23 @@ done
 
 ---
 
-## April 13 — Phase 2/3 CIFAR ResNet Work, Validation, and New 5090 Baseline
+## April 13 — CIFAR ResNet consolidation notes
 
-### Phase 2 selective-stage perturbation implementation
+Short summary:
+- Phase 2 and Phase 3 codepaths landed and passed local targeted tests.
+- The fresh 5090 baseline `batch + kernel_lora` run finished at `28.27%`.
+- `bntt + kernel_lora` was effectively a wash versus the baseline.
+- `batch + matrix_lora` regressed badly and was killed after the first full-refresh epoch.
 
-Implemented:
-- stage-group taxonomy for `spiking_resnet18`
-- selective perturbation schedule:
-  - early: `stage3 + head`
-  - mid: `stage2 + stage3 + head`
-  - periodic full refresh
-- active ES-map masking by stage group
-- deterministic prefix caching with noisy suffix-only forward
-- per-epoch metrics:
-  - `perturbation_phase`
-  - `active_stage_groups`
-  - `cache_split`
-  - `active_param_fraction`
+Authoritative sources:
+- current CIFAR status and comparisons: [experiments/cifar.md](experiments/cifar.md)
+- current roadmap: [roadmaps/cifar-resnet-roadmap.md](roadmaps/cifar-resnet-roadmap.md)
 
-Validation:
-```bash
-.venv/bin/python -m pytest tests/test_eggroll.py tests/test_lif.py tests/test_cifar10.py tests/test_model.py tests/test_runtime.py -q
-# 52 passed
-```
-
-Takeaway:
-- selective perturbation is implemented and locally validated
-- prefix/suffix cached forward matches full forward in tests
-- selective updates only touch the intended active stages
-
-### Phase 3 implementation: BNTT + conv `matrix_lora`
-
-Implemented:
-- new `resnet_norm="bntt"` mode with:
-  - per-timestep affine weights
-  - per-timestep running mean/variance
-  - timestep-aware scan/prefix/suffix forward handling
-- running-stat evaluation path extended from `batch` to `batch|bntt`
-- new `conv_es_mode`:
-  - `kernel_lora` (existing dense noisy-kernel path)
-  - `matrix_lora` (dense base conv + patch-space low-rank delta)
-
-Validation:
-- `tests/test_runtime.py` passed
-- `tests/test_model.py` passed
-- `tests/test_cifar10.py` passed
-
-Takeaway:
-- the repo now has both the literature-aligned BNTT path and the systems-facing
-  `matrix_lora` conv forward
-- local correctness is good, but 5090 performance/learning impact still needs
-  hardware comparison
-
-### Fresh remote baseline from GitHub clone
-
-Host:
-- `216.249.100.66:21650`
-
-Source:
-- fresh clone of `https://github.com/utkuarslandev/spikyeggrolls.git`
-- cloned commit reported as `94d9afc`
-
-Bootstrap:
-```bash
-make bootstrap-runpod
-```
-
-Baseline command:
-```bash
-.venv/bin/python -m spikyeggroll.train \
-  --dataset cifar10 --model_name spiking_resnet18 \
-  --pop_size 4096 --rank 2 --sigma 0.006 --lr 0.0015 \
-  --epochs 30 --updates_per_epoch 10 \
-  --timesteps 16 --batch_size 48 --chunk_size 96 \
-  --augment --dtype bfloat16 \
-  --resnet_channels_base 32 \
-  --resnet_norm batch \
-  --conv_es_mode kernel_lora \
-  --selective_stage_perturbation \
-  --stage_perturbation_schedule head_last_then_last2 \
-  --stage_perturbation_early_fraction 0.30 \
-  --stage_perturbation_full_epoch_interval 8 \
-  --sigma_warmup_epochs 20 \
-  --test_interval 5 --checkpoint_interval 10 --log_interval 1 \
-  --num_test_eval_samples 1024 \
-  --profile_mode steady_state \
-  --profile_warmup_updates 5 \
-  --profile_updates_window 3 \
-  --profile_eval_once \
-  --profile_server_port 9999 \
-  --run_name cifar5090-phase3-baseline-batch-kernel-20260413
-```
-
-Finished result:
-- run healthy end to end, no startup stall
-- GPU memory during training: about `24.65 / 32.6 GiB`
-- GPU utilization: sustained high utilization; occasional `0%` samples were just
-  transient between-kernel snapshots
-- completed:
-  - `30` logged epochs
-  - `300` updates
-  - `1783.9s` wall-clock, about `29.7 min`
-- test accuracy checkpoints:
-  - `epoch 5`: `20.73%`
-  - `epoch 10`: `23.81%`
-  - `epoch 15`: `25.89%`
-  - `epoch 20`: `26.19%`
-  - `epoch 25`: `26.98%`
-  - final summary: `28.27%`
-
-Timing by selective phase:
-- early selective (`stage3 + head`, `cache_split=after_stage2`):
-  - `active_param_fraction ≈ 0.274`
-  - `population_score_mean_s ≈ 2.35-2.38s`
-  - `avg_update_s ≈ 3.6-3.8s`
-- full-model refresh (`epoch 8`, `epoch 16`, `epoch 24`):
-  - `active_param_fraction = 1.0`
-  - `population_score_mean_s ≈ 15.64-19.25s`
-  - `avg_update_s ≈ 15.69-20.77s`
-- mid selective (`stage2 + stage3 + head`, `cache_split=after_stage1`):
-  - `active_param_fraction ≈ 0.516`
-  - initial transition epoch: `population_score_mean_s ≈ 6.75s`
-  - steady state: `population_score_mean_s ≈ 4.89s`
-  - steady-state `avg_update_s ≈ 4.93-4.95s`
-
-Sigma behavior:
-- held at `0.006` through most of training
-- resumed decay late:
-  - `epoch 20`: `0.00543`
-  - `epoch 25`: `0.00335`
-  - `epoch 28-29`: hit `sigma_min = 0.0025`
-
-Takeaway:
-- selective perturbation is not a cosmetic change; it dramatically changes wall
-  clock cost
-- the runtime ordering is now explicit:
-  - early selective: cheapest
-  - mid selective: intermediate
-  - full refresh: very expensive
-- this baseline is now the new reference for comparing:
-  - `bntt + kernel_lora`
-  - `batch + matrix_lora`
-  - `bntt + matrix_lora`
-- it also exceeds the earlier pre-Phase 3 CIFAR best of `22.33%`
-
-### BNTT-only remote comparison on the same 5090 host
-
-Host and source:
-- host: `216.249.100.66:21650`
-- repo: fresh clone of `utkuarslandev/spikyeggrolls`
-- commit: `94d9afc`
-
-Command:
-```bash
-.venv/bin/python -m spikyeggroll.train \
-  --dataset cifar10 --model_name spiking_resnet18 \
-  --pop_size 4096 --rank 2 --sigma 0.006 --lr 0.0015 \
-  --epochs 30 --updates_per_epoch 10 \
-  --timesteps 16 --batch_size 48 --chunk_size 96 \
-  --augment --dtype bfloat16 \
-  --resnet_channels_base 32 \
-  --resnet_norm bntt \
-  --resnet_bntt_momentum 0.9 \
-  --resnet_bntt_eps 1e-5 \
-  --conv_es_mode kernel_lora \
-  --selective_stage_perturbation \
-  --stage_perturbation_schedule head_last_then_last2 \
-  --stage_perturbation_early_fraction 0.30 \
-  --stage_perturbation_full_epoch_interval 8 \
-  --sigma_warmup_epochs 20 \
-  --test_interval 5 --checkpoint_interval 10 --log_interval 1 \
-  --num_test_eval_samples 1024 \
-  --profile_mode steady_state \
-  --profile_warmup_updates 5 \
-  --profile_updates_window 3 \
-  --profile_eval_once \
-  --profile_server_port 9999 \
-  --run_name cifar5090-phase3-bntt-kernel
-```
-
-Final result:
-- `30` epochs, `300` updates
-- `1760.3s` wall-clock
-- final test accuracy: `28.17%`
-- checkpoint best: `26.39%` at `epoch 25`
-
-Observed test checkpoints:
-- `epoch 10`: `23.91%`
-- `epoch 15`: `24.80%`
-- `epoch 20`: `25.60%`
-- `epoch 25`: `26.39%`
-- final summary: `28.17%`
-
-Comparison against the `batch + kernel_lora` baseline:
-- baseline final test: `28.27%`
-- `bntt` final test: `28.17%`
-- baseline checkpoint best: `26.98%`
-- `bntt` checkpoint best: `26.39%`
-
-Timing comparison:
-- early selective:
-  - baseline `population_score_mean_s ≈ 2.37s`
-  - `bntt ≈ 2.42s`
-- mid selective:
-  - baseline `≈ 4.89s`
-  - `bntt ≈ 4.94s`
-- full refresh:
-  - baseline `≈ 15.64-19.25s`
-  - `bntt ≈ 15.59-17.13s`
-
-Takeaway:
-- `bntt` is not a convincing improvement in the current ES regime
-- runtime is nearly unchanged
-- learning is extremely close, but `batch` remains slightly better
-- next meaningful comparison is `batch + matrix_lora`
-
-### Matrix-LoRA remote comparison on the same 5090 host
-
-Host and source:
-- host: `216.249.100.66:21650`
-- repo: fresh clone of `utkuarslandev/spikyeggrolls`
-- commit: `94d9afc`
-
-Command:
-```bash
-.venv/bin/python -m spikyeggroll.train \
-  --dataset cifar10 --model_name spiking_resnet18 \
-  --pop_size 4096 --rank 2 --sigma 0.006 --lr 0.0015 \
-  --epochs 30 --updates_per_epoch 10 \
-  --timesteps 16 --batch_size 48 --chunk_size 96 \
-  --augment --dtype bfloat16 \
-  --resnet_channels_base 32 \
-  --resnet_norm batch \
-  --conv_es_mode matrix_lora \
-  --selective_stage_perturbation \
-  --stage_perturbation_schedule head_last_then_last2 \
-  --stage_perturbation_early_fraction 0.30 \
-  --stage_perturbation_full_epoch_interval 8 \
-  --sigma_warmup_epochs 20 \
-  --test_interval 5 --checkpoint_interval 10 --log_interval 1 \
-  --num_test_eval_samples 1024 \
-  --profile_mode steady_state \
-  --profile_warmup_updates 5 \
-  --profile_updates_window 3 \
-  --profile_eval_once \
-  --profile_server_port 9999 \
-  --run_name cifar5090-phase3-batch-matrix
-```
-
-Observed behavior before stopping:
-- run stayed alive and compute-bound
-- GPU memory stayed stable around `24.65 / 32.6 GiB`
-- reached `epoch 8`
-- hit the first `full_model_refresh`
-
-Learning before stop:
-- `epoch 5` test accuracy: `20.93%`
-
-Runtime compared to the `batch + kernel_lora` baseline:
-- early selective:
-  - baseline `population_score_mean_s ≈ 2.37s`
-  - `matrix_lora ≈ 7.47s`
-- full refresh:
-  - baseline `≈ 15.64-19.25s`
-  - `matrix_lora ≈ 191.4s`
-- full-refresh total update mean:
-  - baseline `≈ 15.69-20.77s`
-  - `matrix_lora ≈ 193.1s`
-
-Decision:
-- killed the run at `epoch 8`
-- current `matrix_lora` implementation is a severe runtime regression
-- do not benchmark `bntt + matrix_lora` on top of this implementation
-
-Likely issue:
-- the patch-extraction delta path is too expensive in the current JAX implementation
-
-Recommended salvage direction if revisited:
-- selective phases only
-- late-stage convs only
-- `1x1` convs first
+Operational notes:
+- keep `batch + kernel_lora + selective perturbation` as the active baseline
+- do not benchmark `bntt + matrix_lora` until `matrix_lora` is narrowed and made competitive
+- preserve April 13 as the point where CIFAR experiment reporting moved out of
+  `daily-notes.md` and into the dedicated experiment doc
 | 256 | 0.865 | 7358 |
 | 128 | 0.843 | 4220 |
 | 64 | 0.995 | 9355 |
@@ -804,7 +541,7 @@ Takeaway:
 ### Planning handoff
 
 - The detailed implementation roadmap for the next CIFAR ResNet work now lives
-  in [docs/cifar-resnet-phased-implementation-plan.md](docs/cifar-resnet-phased-implementation-plan.md).
+  in [roadmaps/cifar-resnet-roadmap.md](roadmaps/cifar-resnet-roadmap.md).
 - That document is the primary source of truth for phase ordering, acceptance
   criteria, and the 5090 validation matrix.
 

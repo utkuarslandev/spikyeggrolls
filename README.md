@@ -144,10 +144,16 @@ current 5090 experiments:
 `FITNESS_SHAPING=centered_rank`, `USE_BATCHED_UPDATE=true`,
 `DTYPE=bfloat16`, `SIGMA_MAX=0.012`, and `NUM_TEST_EVAL_SAMPLES=1024`.
 
-See [docs/cifar-experiments-log.md](docs/cifar-experiments-log.md) for the
-current CIFAR results and failure modes. The phased implementation roadmap for
-improving CIFAR ResNet training is in
-[docs/cifar-resnet-phased-implementation-plan.md](docs/cifar-resnet-phased-implementation-plan.md).
+## Docs
+
+- CIFAR experiment status and comparisons:
+  [docs/experiments/cifar.md](docs/experiments/cifar.md)
+- MNIST baseline experiments:
+  [docs/experiments/mnist-baseline.md](docs/experiments/mnist-baseline.md)
+- CIFAR implementation roadmap:
+  [docs/roadmaps/cifar-resnet-roadmap.md](docs/roadmaps/cifar-resnet-roadmap.md)
+- Runpod setup and workflow:
+  [docs/getting-started/runpod.md](docs/getting-started/runpod.md)
 
 Population-scaling sweep example (6 settings, 3 seeds each):
 
@@ -173,7 +179,8 @@ done
 - **Centered rank fitness shaping** is scale-free and outlier-robust; comparable to z-scoring.
 - **No surrogate gradients needed**: EGGROLL's low-rank perturbations provide enough signal to train a 3-layer SNN from random init.
 
-See [docs/baseline-validation.md](docs/baseline-validation.md) for full experiment details, sweep results, and ablation studies.
+See [docs/experiments/mnist-baseline.md](docs/experiments/mnist-baseline.md)
+for full MNIST baseline details, sweep results, and ablation studies.
 
 ## Dependencies
 
@@ -191,4 +198,5 @@ path. The upstream license text is included at
 
 ## Runpod
 
-See [RUNPOD.md](RUNPOD.md) for a Pod setup guide, bootstrap script, and smoke/tuning commands.
+See [docs/getting-started/runpod.md](docs/getting-started/runpod.md) for a Pod
+setup guide, bootstrap script, and smoke/tuning commands.

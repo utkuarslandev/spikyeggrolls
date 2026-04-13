@@ -1,4 +1,10 @@
-# Pure-Spiking CIFAR Optimization Notes
+# Archived: Pure-Spiking CIFAR Optimization Notes
+
+This document is archived.
+
+Current sources of truth:
+- live experiment status: [../experiments/cifar.md](../experiments/cifar.md)
+- live implementation roadmap: [../roadmaps/cifar-resnet-roadmap.md](../roadmaps/cifar-resnet-roadmap.md)
 
 ## Summary
 
@@ -254,4 +260,3 @@ The best near-term strategy is:
 The best long-term systems strategy is:
 
 - redesign the conv noisy-forward path so conv layers benefit from EGGROLL-style low-rank forward efficiency, not only low-rank updates
-

@@ -1,4 +1,10 @@
-# CIFAR ResNet Handoff
+# Archived: CIFAR ResNet Handoff
+
+This document is archived.
+
+Current sources of truth:
+- live experiment status: [../experiments/cifar.md](../experiments/cifar.md)
+- live implementation roadmap: [../roadmaps/cifar-resnet-roadmap.md](../roadmaps/cifar-resnet-roadmap.md)
 
 This document summarizes the current CIFAR-10 `spiking_resnet18` state, the
 profiling findings from the latest 5090 runs, the main limiting factors, and the
