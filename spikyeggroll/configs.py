@@ -42,6 +42,16 @@ class SNNConfig:
     checkpoint_interval: int = 100
     sigma_warmup_epochs: int = 20
 
+    # Profiling
+    profile_mode: str = "off"
+    profile_trace_dir: Optional[str] = None
+    profile_server_port: Optional[int] = None
+    profile_max_snapshots: int = 16
+    profile_warmup_updates: int = 5
+    profile_updates_window: int = 3
+    profile_eval_once: bool = False
+    profile_sync_timings: bool = True
+
     # Data
     dataset: str = "mnist"
     data_path: str = "data"

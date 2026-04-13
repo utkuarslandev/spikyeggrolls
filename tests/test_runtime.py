@@ -59,6 +59,14 @@ def test_cifar_model_defaults_reflect_debug_baseline_architecture():
     assert cfg.sigma_min == 0.001
     assert cfg.sigma_max == 1.0
     assert cfg.sigma_warmup_epochs == 20
-    assert cfg.updates_per_epoch == 1
+    assert cfg.updates_per_epoch == 10
     assert cfg.fitness_shaping == "zscore"
     assert cfg.use_batched_update is False
+    assert cfg.profile_mode == "off"
+    assert cfg.profile_trace_dir is None
+    assert cfg.profile_server_port is None
+    assert cfg.profile_max_snapshots == 16
+    assert cfg.profile_warmup_updates == 5
+    assert cfg.profile_updates_window == 3
+    assert cfg.profile_eval_once is False
+    assert cfg.profile_sync_timings is True

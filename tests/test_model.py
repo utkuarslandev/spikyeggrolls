@@ -4,6 +4,7 @@ import pytest
 import jax
 import jax.numpy as jnp
 import json
+from pathlib import Path
 
 from spikyeggroll.configs import SNNConfig
 from spikyeggroll.eval import evaluate
@@ -161,6 +162,39 @@ def test_cli_cifar_resnet_defaults_enable_perf_path():
     assert cfg.sigma_max == pytest.approx(0.012)
 
 
+def test_cli_profile_flags_roundtrip():
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--profile_mode",
+            "full",
+            "--profile_trace_dir",
+            "/tmp/traces",
+            "--profile_server_port",
+            "9999",
+            "--profile_max_snapshots",
+            "7",
+            "--profile_warmup_updates",
+            "2",
+            "--profile_updates_window",
+            "4",
+            "--profile_eval_once",
+            "--no-profile_sync_timings",
+        ]
+    )
+
+    cfg = build_config_from_args(args)
+
+    assert cfg.profile_mode == "full"
+    assert cfg.profile_trace_dir == "/tmp/traces"
+    assert cfg.profile_server_port == 9999
+    assert cfg.profile_max_snapshots == 7
+    assert cfg.profile_warmup_updates == 2
+    assert cfg.profile_updates_window == 4
+    assert cfg.profile_eval_once is True
+    assert cfg.profile_sync_timings is False
+
+
 def test_cli_rejects_removed_legacy_resnet_flags():
     parser = build_parser()
     with pytest.raises(SystemExit):
@@ -232,3 +266,178 @@ def test_train_updates_per_epoch_and_sigma_max(monkeypatch, tmp_path):
     assert all(r["sigma"] <= cfg.sigma_max + 1e-8 for r in epoch_records)
     assert summary["completed_updates"] == 6
     assert 0.0 <= test_acc <= 1.0
+
+
+def _install_dummy_dataset(monkeypatch):
+    def loader():
+        train_images = jnp.linspace(0.0, 1.0, 16 * 8, dtype=jnp.float32).reshape(16, 8)
+        train_labels = (jnp.arange(16) % 2).astype(jnp.int32)
+        test_images = train_images[:8]
+        test_labels = train_labels[:8]
+        return train_images, train_labels, test_images, test_labels
+
+    def encoder(images, timesteps, key):
+        del key
+        return jnp.broadcast_to(images[:, None, :], (images.shape[0], timesteps, images.shape[1]))
+
+    monkeypatch.setattr(
+        "spikyeggroll.train.get_dataset_spec",
+        lambda cfg: DatasetSpec(
+            loader=loader,
+            encoder=encoder,
+            n_inputs=8,
+            in_channels=1,
+            image_size=1,
+        ),
+    )
+
+
+def _install_dummy_profiler(monkeypatch):
+    state = {"current_trace": None, "started": [], "stopped": 0, "servers": []}
+
+    def start_trace(path):
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        state["current_trace"] = path
+        state["started"].append(str(path))
+
+    def stop_trace():
+        path = state["current_trace"]
+        if path is not None:
+            (path / f"trace-{state['stopped']}.txt").write_text("trace", encoding="utf-8")
+            state["current_trace"] = None
+        state["stopped"] += 1
+
+    def save_device_memory_profile(path):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("memory-profile", encoding="utf-8")
+
+    def start_server(port):
+        state["servers"].append(port)
+
+    monkeypatch.setattr("spikyeggroll.train.jax.profiler.start_trace", start_trace)
+    monkeypatch.setattr("spikyeggroll.train.jax.profiler.stop_trace", stop_trace)
+    monkeypatch.setattr(
+        "spikyeggroll.train.jax.profiler.save_device_memory_profile",
+        save_device_memory_profile,
+    )
+    monkeypatch.setattr("spikyeggroll.train.jax.profiler.start_server", start_server)
+    return state
+
+
+def test_train_startup_profile_writes_artifacts(monkeypatch, tmp_path):
+    _install_dummy_dataset(monkeypatch)
+    profiler_state = _install_dummy_profiler(monkeypatch)
+
+    cfg = SNNConfig(
+        dataset="mnist",
+        model_name="mlp_snn",
+        n_inputs=8,
+        hidden_size=4,
+        n_classes=2,
+        timesteps=2,
+        pop_size=4,
+        rank=1,
+        sigma=0.02,
+        sigma_min=0.001,
+        sigma_max=0.005,
+        lr=0.001,
+        batch_size=2,
+        chunk_size=2,
+        num_epochs=1,
+        updates_per_epoch=2,
+        sigma_warmup_epochs=0,
+        log_interval=1,
+        test_interval=1,
+        checkpoint_interval=0,
+        run_name="pytest-profile-startup",
+        log_dir=str(tmp_path / "logs"),
+        checkpoint_dir=str(tmp_path / "ckpts"),
+        profile_mode="startup",
+        profile_server_port=9999,
+        profile_max_snapshots=4,
+        profile_eval_once=True,
+    )
+
+    train(cfg)
+
+    startup_path = tmp_path / "logs" / "pytest-profile-startup.startup.jsonl"
+    profile_summary = tmp_path / "logs" / "pytest-profile-startup.profile-summary.json"
+    metrics_path = tmp_path / "logs" / "pytest-profile-startup.metrics.jsonl"
+    profile_dir = tmp_path / "logs" / "profiles" / "pytest-profile-startup"
+    trace_dir = tmp_path / "logs" / "traces" / "pytest-profile-startup" / "startup"
+
+    assert startup_path.exists()
+    startup_records = [json.loads(line) for line in startup_path.read_text().splitlines() if line.strip()]
+    labels = [record["label"] for record in startup_records]
+    assert "train() begin run_name=pytest-profile-startup" in labels
+    assert "start metric written" in labels
+    assert any("startup trace started" in label for label in labels)
+    assert any("startup trace stopped" in label for label in labels)
+    assert profile_summary.exists()
+    assert any(profile_dir.glob("*.pb"))
+    assert any(trace_dir.glob("*"))
+    records = [json.loads(line) for line in metrics_path.read_text().splitlines() if line.strip()]
+    epoch_record = next(record for record in records if record["event"] == "epoch")
+    assert "timing_population_score_mean_s" in epoch_record
+    assert "eval_test_total_s" in epoch_record
+    assert any(record["event"] == "eval_profile" for record in records)
+    assert profiler_state["servers"] == [9999]
+
+
+def test_train_steady_state_profile_window_and_paths(monkeypatch, tmp_path):
+    _install_dummy_dataset(monkeypatch)
+    _install_dummy_profiler(monkeypatch)
+
+    cfg = SNNConfig(
+        dataset="mnist",
+        model_name="mlp_snn",
+        n_inputs=8,
+        hidden_size=4,
+        n_classes=2,
+        timesteps=2,
+        pop_size=4,
+        rank=1,
+        sigma=0.02,
+        sigma_min=0.001,
+        sigma_max=0.005,
+        lr=0.001,
+        batch_size=2,
+        chunk_size=2,
+        num_epochs=1,
+        updates_per_epoch=3,
+        sigma_warmup_epochs=0,
+        log_interval=1,
+        test_interval=0,
+        checkpoint_interval=0,
+        run_name="pytest-profile-steady",
+        log_dir=str(tmp_path / "logs"),
+        checkpoint_dir=str(tmp_path / "ckpts"),
+        profile_mode="steady_state",
+        profile_warmup_updates=1,
+        profile_updates_window=1,
+        profile_max_snapshots=6,
+    )
+
+    train(cfg)
+
+    startup_path = tmp_path / "logs" / "pytest-profile-steady.startup.jsonl"
+    startup_records = [json.loads(line) for line in startup_path.read_text().splitlines() if line.strip()]
+    labels = [record["label"] for record in startup_records]
+    assert any("steady-state trace started" in label for label in labels)
+    assert any("steady-state trace stopped" in label for label in labels)
+
+    trace_dir = tmp_path / "logs" / "traces" / "pytest-profile-steady" / "steady_state"
+    assert any(trace_dir.glob("*"))
+
+    metrics_path = tmp_path / "logs" / "pytest-profile-steady.metrics.jsonl"
+    epoch_record = next(
+        record
+        for record in (json.loads(line) for line in metrics_path.read_text().splitlines() if line.strip())
+        if record["event"] == "epoch"
+    )
+    assert "timing_total_update_mean_s" in epoch_record
+    assert "timing_population_score_frac" in epoch_record
+    assert (tmp_path / "logs" / "pytest-profile-steady.profile-summary.json").exists()
+    assert (tmp_path / "ckpts").exists()

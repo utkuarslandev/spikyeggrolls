@@ -1,11 +1,9 @@
 """Main training loop using EGGROLL evolution strategies."""
 
 import argparse
-from collections import deque
+from collections import defaultdict, deque
 import json
-import os
 import pickle
-import re
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -120,72 +118,356 @@ def summarize_output_activity(outputs):
     }
 
 
-def _trace_enabled():
-    return os.environ.get("SPIKYEGGROLL_TRACE_STARTUP", "0") == "1"
+def _block_tree(value):
+    leaves = jax.tree_util.tree_leaves(value)
+    for leaf in leaves:
+        if hasattr(leaf, "block_until_ready"):
+            leaf.block_until_ready()
+    return value
 
 
-def _profile_enabled():
-    return os.environ.get("SPIKYEGGROLL_PROFILE_STARTUP", "0") == "1"
+class ProfilingController:
+    STARTUP_SNAPSHOT_LABELS = {
+        "train-begin",
+        "model-init-complete",
+        "dataset-loaded",
+        "prefetch-ready",
+        "start-metric-written",
+        "jit-forward-eval-ready",
+        "population-scores-ready",
+        "jit-update-ready",
+    }
+    STEADY_STATE_SNAPSHOT_LABELS = {
+        "steady-state-forward-eval-ready",
+        "steady-state-population-scores-ready",
+        "steady-state-jit-update-ready",
+        "steady-state-eval-ready",
+    }
 
-
-def _trace_capture_enabled():
-    return os.environ.get("SPIKYEGGROLL_PROFILE_TRACE", "0") == "1"
-
-
-def _profile_server_port():
-    port = os.environ.get("SPIKYEGGROLL_PROFILE_SERVER_PORT")
-    return int(port) if port else None
-
-
-def _profile_snapshot_limit():
-    return int(os.environ.get("SPIKYEGGROLL_PROFILE_MAX_SNAPSHOTS", "16"))
-
-
-_PROFILE_SNAPSHOT_INDEX = 0
-
-
-def _startup_profile_path(run_name: str, label: str) -> Path:
-    global _PROFILE_SNAPSHOT_INDEX
-    _PROFILE_SNAPSHOT_INDEX += 1
-    root = Path(
-        os.environ.get(
-            "SPIKYEGGROLL_PROFILE_DIR",
-            f"logs/spikyeggroll/profiles/{run_name}",
+    def __init__(self, cfg: SNNConfig, log_dir: Path):
+        self.cfg = cfg
+        self.enabled = cfg.profile_mode != "off"
+        self.sync_timings = cfg.profile_sync_timings
+        self.log_dir = log_dir.resolve()
+        self.run_name = cfg.run_name
+        self.start_time = time.time()
+        self.startup_path = self.log_dir / f"{cfg.run_name}.startup.jsonl"
+        self.summary_path = self.log_dir / f"{cfg.run_name}.profile-summary.json"
+        self.trace_root = (
+            Path(cfg.profile_trace_dir).resolve()
+            if cfg.profile_trace_dir
+            else (self.log_dir / "traces").resolve()
         )
-    )
-    safe = re.sub(r"[^a-zA-Z0-9._-]+", "-", label).strip("-") or "snapshot"
-    root.mkdir(parents=True, exist_ok=True)
-    return root / f"{_PROFILE_SNAPSHOT_INDEX:03d}-{safe}.pb"
+        self.profile_root = (self.log_dir / "profiles").resolve()
+        self.profile_run_root = self.profile_root / cfg.run_name
+        self.trace_run_root = self.trace_root / cfg.run_name
+        self.profile_run_root.mkdir(parents=True, exist_ok=True)
+        self.trace_run_root.mkdir(parents=True, exist_ok=True)
+        self.snapshot_count = 0
+        self.startup_events = []
+        self.overall_stage_timings = defaultdict(list)
+        self.eval_timings = []
+        self.eval_once_recorded = False
+        self.server_port = cfg.profile_server_port
+        self.server_started = False
+        self.startup_trace_started = False
+        self.startup_trace_stopped = False
+        self.startup_trace_dir = self.trace_run_root / "startup"
+        self.steady_trace_started = False
+        self.steady_trace_stopped = False
+        self.steady_trace_dir = self.trace_run_root / "steady_state"
+        self.steady_trace_start_update = cfg.profile_warmup_updates
+        self.steady_trace_stop_update = cfg.profile_warmup_updates + cfg.profile_updates_window
+        self._startup_trace_active = False
+        self._steady_trace_active = False
+        self.profile_run_root.mkdir(parents=True, exist_ok=True)
+        self.trace_run_root.mkdir(parents=True, exist_ok=True)
 
+    def _write_startup_record(self, record: dict):
+        self.startup_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.startup_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, sort_keys=True) + "\n")
 
-def trace_startup(label: str):
-    if _trace_enabled():
+    def log_startup(self, label: str, epoch: int | None = None, global_update: int | None = None):
+        if not self.enabled:
+            return
+        timestamp = time.time()
+        record = {
+            "label": label,
+            "timestamp": timestamp,
+            "elapsed_s": timestamp - self.start_time,
+            "epoch": epoch,
+            "global_update": global_update,
+        }
+        self.startup_events.append(record)
+        self._write_startup_record(record)
         print(
             f"[startup {time.strftime('%Y-%m-%d %H:%M:%S')}] {label}",
             flush=True,
         )
 
+    def maybe_start_server(self, epoch: int | None = None, global_update: int | None = None):
+        if not self.enabled or self.server_port is None or self.server_started:
+            return
+        try:
+            jax.profiler.start_server(self.server_port)
+            self.server_started = True
+            self.log_startup(
+                f"profiler server listening on port {self.server_port}",
+                epoch=epoch,
+                global_update=global_update,
+            )
+        except Exception as exc:
+            self.log_startup(
+                f"profiler server failed: {exc}",
+                epoch=epoch,
+                global_update=global_update,
+            )
 
-def trace_profile(run_name: str, label: str):
-    if not _profile_enabled():
-        return
-    if _PROFILE_SNAPSHOT_INDEX >= _profile_snapshot_limit():
-        return
-    path = _startup_profile_path(run_name, label)
-    trace_startup(f"{label}: saving memory profile -> {path}")
-    try:
-        jax.profiler.save_device_memory_profile(str(path))
-        trace_startup(f"{label}: memory profile saved")
-    except Exception as exc:
-        trace_startup(f"{label}: memory profile failed: {exc}")
+    def _capture_snapshot(self, label: str, epoch: int | None = None, global_update: int | None = None):
+        if not self.enabled or self.snapshot_count >= self.cfg.profile_max_snapshots:
+            return
+        self.snapshot_count += 1
+        path = self.profile_run_root / f"{self.snapshot_count:03d}-{label}.pb"
+        self.log_startup(
+            f"{label}: saving memory profile -> {path}",
+            epoch=epoch,
+            global_update=global_update,
+        )
+        try:
+            jax.profiler.save_device_memory_profile(str(path))
+            self.log_startup(
+                f"{label}: memory profile saved",
+                epoch=epoch,
+                global_update=global_update,
+            )
+        except Exception as exc:
+            self.log_startup(
+                f"{label}: memory profile failed: {exc}",
+                epoch=epoch,
+                global_update=global_update,
+            )
 
+    def maybe_snapshot(self, label: str, epoch: int | None = None, global_update: int | None = None):
+        if not self.enabled:
+            return
+        if label in self.STARTUP_SNAPSHOT_LABELS:
+            self._capture_snapshot(label, epoch=epoch, global_update=global_update)
+        elif self.label_for_steady_state(label) in self.STEADY_STATE_SNAPSHOT_LABELS:
+            self._capture_snapshot(
+                self.label_for_steady_state(label),
+                epoch=epoch,
+                global_update=global_update,
+            )
 
-def trace_block(label: str, value):
-    if _trace_enabled():
-        trace_startup(f"{label}: waiting for device")
-        jax.block_until_ready(value)
-        trace_startup(f"{label}: device ready")
-    return value
+    def maybe_block(self, label: str, value, epoch: int | None = None, global_update: int | None = None):
+        if self.enabled and self.sync_timings:
+            self.log_startup(
+                f"{label}: waiting for device",
+                epoch=epoch,
+                global_update=global_update,
+            )
+            _block_tree(value)
+            self.log_startup(
+                f"{label}: device ready",
+                epoch=epoch,
+                global_update=global_update,
+            )
+        return value
+
+    def maybe_start_startup_trace(self, epoch: int | None = None, global_update: int | None = None):
+        if not self.enabled or self.cfg.profile_mode not in {"startup", "full"} or self.startup_trace_started:
+            return
+        self.startup_trace_dir.mkdir(parents=True, exist_ok=True)
+        jax.profiler.start_trace(str(self.startup_trace_dir))
+        self.startup_trace_started = True
+        self._startup_trace_active = True
+        self.log_startup(
+            f"startup trace started -> {self.startup_trace_dir}",
+            epoch=epoch,
+            global_update=global_update,
+        )
+
+    def finish_startup_trace(self, label: str, epoch: int | None = None, global_update: int | None = None):
+        if self._startup_trace_active and not self.startup_trace_stopped:
+            jax.profiler.stop_trace()
+            self._startup_trace_active = False
+            self.startup_trace_stopped = True
+            self.log_startup(
+                f"startup trace stopped at {label}",
+                epoch=epoch,
+                global_update=global_update,
+            )
+
+    def maybe_start_steady_state_trace(self, global_update: int, epoch: int | None = None):
+        if (
+            not self.enabled
+            or self.cfg.profile_mode not in {"steady_state", "full"}
+            or self.steady_trace_started
+            or global_update != self.steady_trace_start_update
+        ):
+            return
+        self.steady_trace_dir.mkdir(parents=True, exist_ok=True)
+        jax.profiler.start_trace(str(self.steady_trace_dir))
+        self.steady_trace_started = True
+        self._steady_trace_active = True
+        self.log_startup(
+            f"steady-state trace started -> {self.steady_trace_dir}",
+            epoch=epoch,
+            global_update=global_update,
+        )
+
+    def finish_steady_state_trace(self, global_update: int, epoch: int | None = None):
+        if self._steady_trace_active and not self.steady_trace_stopped and global_update >= self.steady_trace_stop_update:
+            jax.profiler.stop_trace()
+            self._steady_trace_active = False
+            self.steady_trace_stopped = True
+            self.log_startup(
+                "steady-state trace stopped",
+                epoch=epoch,
+                global_update=global_update,
+            )
+
+    def finish_all_traces(self, label: str, epoch: int | None = None, global_update: int | None = None):
+        self.finish_startup_trace(label, epoch=epoch, global_update=global_update)
+        if self._steady_trace_active and not self.steady_trace_stopped:
+            jax.profiler.stop_trace()
+            self._steady_trace_active = False
+            self.steady_trace_stopped = True
+            self.log_startup(
+                f"steady-state trace stopped at {label}",
+                epoch=epoch,
+                global_update=global_update,
+            )
+
+    def label_for_steady_state(self, label: str) -> str:
+        return f"steady-state-{label}"
+
+    def stage_timed_call(
+        self,
+        stage: str,
+        fn,
+        *,
+        ready_value=None,
+        epoch: int | None = None,
+        global_update: int | None = None,
+    ):
+        t0 = time.perf_counter()
+        result = fn()
+        if self.enabled and self.sync_timings:
+            value = ready_value(result) if callable(ready_value) else (ready_value if ready_value is not None else result)
+            self.maybe_block(stage, value, epoch=epoch, global_update=global_update)
+        dt = time.perf_counter() - t0
+        if self.enabled:
+            self.overall_stage_timings[stage].append(dt)
+        return result, dt
+
+    def record_eval_timing(self, total_s: float, n_chunks: int):
+        if self.enabled:
+            self.eval_timings.append(
+                {
+                    "total_s": total_s,
+                    "chunk_mean_s": (total_s / n_chunks) if n_chunks > 0 else 0.0,
+                }
+            )
+
+    def aggregate_epoch_timings(self, epoch_timings: dict[str, list[float]], eval_total_s: float | None = None):
+        if not self.enabled or not epoch_timings.get("total_update_s"):
+            return {}
+
+        def stats(values):
+            arr = np.asarray(values, dtype=np.float64)
+            return float(arr.mean()), float(np.median(arr)), float(arr.max())
+
+        total_mean, total_median, total_max = stats(epoch_timings["total_update_s"])
+        result = {
+            "timing_total_update_mean_s": total_mean,
+            "timing_total_update_median_s": total_median,
+            "timing_total_update_max_s": total_max,
+        }
+        for stage in [
+            "sample_encode_s",
+            "forward_eval_s",
+            "population_score_s",
+            "update_s",
+            "post_update_stats_s",
+        ]:
+            if epoch_timings.get(stage):
+                mean, median, max_v = stats(epoch_timings[stage])
+                prefix = stage.removesuffix("_s")
+                result[f"timing_{prefix}_mean_s"] = mean
+                if stage in {"population_score_s"}:
+                    result[f"timing_{prefix}_median_s"] = median
+                    result[f"timing_{prefix}_max_s"] = max_v
+                result[f"timing_{prefix}_frac"] = mean / total_mean if total_mean > 0 else 0.0
+        if eval_total_s is not None:
+            result["timing_eval_frac_epoch"] = eval_total_s / (eval_total_s + sum(epoch_timings["total_update_s"])) if (eval_total_s + sum(epoch_timings["total_update_s"])) > 0 else 0.0
+        return result
+
+    def write_summary(self):
+        if not self.enabled:
+            return
+
+        def aggregate(values):
+            if not values:
+                return None
+            arr = np.asarray(values, dtype=np.float64)
+            return {
+                "mean_s": float(arr.mean()),
+                "median_s": float(np.median(arr)),
+                "max_s": float(arr.max()),
+            }
+
+        stage_summary = {
+            stage: aggregate(values)
+            for stage, values in self.overall_stage_timings.items()
+            if values
+        }
+        total_mean = stage_summary.get("total_update_s", {}).get("mean_s", 0.0) if stage_summary.get("total_update_s") else 0.0
+        bottlenecks = []
+        for stage in [
+            "population_score_s",
+            "update_s",
+            "sample_encode_s",
+            "forward_eval_s",
+        ]:
+            summary = stage_summary.get(stage)
+            if summary and total_mean > 0:
+                bottlenecks.append(
+                    {
+                        "stage": stage.removesuffix("_s"),
+                        "fraction": summary["mean_s"] / total_mean,
+                    }
+                )
+        if self.eval_timings:
+            eval_mean = float(np.mean([item["total_s"] for item in self.eval_timings]))
+            bottlenecks.append({"stage": "eval_test", "fraction": eval_mean / total_mean if total_mean > 0 else 0.0})
+        bottlenecks.sort(key=lambda item: item["fraction"], reverse=True)
+
+        payload = {
+            "profile_mode": self.cfg.profile_mode,
+            "startup_events": self.startup_events,
+            "startup_trace_captured": self.startup_trace_started,
+            "startup_trace_stopped": self.startup_trace_stopped,
+            "startup_trace_dir": str(self.startup_trace_dir) if self.startup_trace_started else None,
+            "steady_state_trace_captured": self.steady_trace_started,
+            "steady_state_trace_stopped": self.steady_trace_stopped,
+            "steady_state_trace_dir": str(self.steady_trace_dir) if self.steady_trace_started else None,
+            "profiler_server_port": self.server_port if self.server_started else None,
+            "memory_snapshots_written": self.snapshot_count,
+            "memory_profile_dir": str(self.profile_run_root),
+            "startup_jsonl": str(self.startup_path),
+            "stage_timing_summary": stage_summary,
+            "eval_timing_summary": {
+                "count": len(self.eval_timings),
+                "mean_total_s": float(np.mean([item["total_s"] for item in self.eval_timings])) if self.eval_timings else None,
+                "mean_chunk_s": float(np.mean([item["chunk_mean_s"] for item in self.eval_timings])) if self.eval_timings else None,
+            },
+            "bottleneck_ranking": bottlenecks,
+        }
+        self.summary_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.summary_path.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True)
 
 
 def train(cfg: SNNConfig = None):
@@ -200,39 +482,17 @@ def train(cfg: SNNConfig = None):
     if cfg is None:
         cfg = SNNConfig()
 
-    log_dir = Path(cfg.log_dir)
-    checkpoint_dir = Path(cfg.checkpoint_dir)
+    log_dir = Path(cfg.log_dir).resolve()
+    checkpoint_dir = Path(cfg.checkpoint_dir).resolve()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = log_dir / f"{cfg.run_name}.metrics.jsonl"
     summary_path = log_dir / f"{cfg.run_name}.summary.json"
-    trace_startup(f"train() begin run_name={cfg.run_name}")
-    trace_profile(cfg.run_name, "train-begin")
-
-    profile_server_port = _profile_server_port()
-    if profile_server_port is not None:
-        jax.profiler.start_server(profile_server_port)
-        trace_startup(f"profiler server listening on port {profile_server_port}")
-
-    trace_dir = Path(
-        os.environ.get(
-            "SPIKYEGGROLL_TRACE_DIR",
-            f"logs/spikyeggroll/traces/{cfg.run_name}",
-        )
-    )
-    startup_trace_active = False
-    startup_trace_complete = False
-    if _trace_capture_enabled():
-        trace_dir.mkdir(parents=True, exist_ok=True)
-        jax.profiler.start_trace(str(trace_dir))
-        startup_trace_active = True
-        trace_startup(f"startup trace started -> {trace_dir}")
-
-    def finish_startup_trace(label: str):
-        nonlocal startup_trace_active, startup_trace_complete
-        if startup_trace_active and not startup_trace_complete:
-            jax.profiler.stop_trace()
-            startup_trace_complete = True
-            startup_trace_active = False
-            trace_startup(f"startup trace stopped at {label}")
+    profiler = ProfilingController(cfg, log_dir)
+    profiler.log_startup(f"train() begin run_name={cfg.run_name}")
+    profiler.maybe_snapshot("train-begin")
+    profiler.maybe_start_server()
+    profiler.maybe_start_startup_trace()
 
     N = cfg.pop_size
     assert N % 2 == 0, "Population size must be even (antithetical sampling)"
@@ -246,14 +506,14 @@ def train(cfg: SNNConfig = None):
     model_cls = get_model_cls(cfg.model_name)
 
     # Initialize model
-    trace_startup("initializing model")
+    profiler.log_startup("initializing model")
     frozen_params, params, scan_map, es_map = model_cls.rand_init(model_key, cfg)
-    trace_startup("model init complete")
-    trace_profile(cfg.run_name, "model-init-complete")
+    profiler.log_startup("model init complete")
+    profiler.maybe_snapshot("model-init-complete")
     es_tree_key = simple_es_tree_key(params, es_key, scan_map)
 
     # Initialize EGGROLL noiser
-    trace_startup("initializing noiser")
+    profiler.log_startup("initializing noiser")
     frozen_noiser_params, noiser_params = EggRoll.init_noiser(
         params,
         cfg.sigma,
@@ -264,8 +524,7 @@ def train(cfg: SNNConfig = None):
         use_batched_update=cfg.use_batched_update,
         fitness_shaping=cfg.fitness_shaping,
     )
-    trace_startup("noiser init complete")
-    trace_profile(cfg.run_name, "noiser-init-complete")
+    profiler.log_startup("noiser init complete")
 
     start_epoch = 0
     global_update = 0
@@ -275,7 +534,7 @@ def train(cfg: SNNConfig = None):
     pending_batch_keys = []
 
     if cfg.resume_from:
-        trace_startup(f"loading checkpoint {cfg.resume_from}")
+        profiler.log_startup(f"loading checkpoint {cfg.resume_from}")
         checkpoint = load_checkpoint(cfg.resume_from)
         params = checkpoint["params"]
         noiser_params = checkpoint["noiser_params"]
@@ -299,13 +558,13 @@ def train(cfg: SNNConfig = None):
         )
 
     # Load dataset
-    trace_startup("loading dataset")
+    profiler.log_startup("loading dataset")
     dataset_spec = get_dataset_spec(cfg)
     train_data, train_labels, test_data, test_labels = dataset_spec.loader()
-    trace_startup(
+    profiler.log_startup(
         f"dataset loaded train={train_data.shape} test={test_data.shape}"
     )
-    trace_profile(cfg.run_name, "dataset-loaded")
+    profiler.maybe_snapshot("dataset-loaded")
     encode_batch_fn = dataset_spec.encoder
     default_n_inputs = dataset_spec.n_inputs
     default_channels = dataset_spec.in_channels
@@ -370,7 +629,7 @@ def train(cfg: SNNConfig = None):
     _do_augment = cfg.augment and cfg.dataset == "cifar10"
 
     # Precompute layer 1 base: x @ W1.T for all timesteps (shared across population)
-    trace_startup("building jit wrappers")
+    profiler.log_startup("building jit wrappers")
     @jax.jit
     def compute_l1_base(params, x):
         """Compute x @ W1.T once, returns [T, B, hidden]."""
@@ -443,12 +702,11 @@ def train(cfg: SNNConfig = None):
                 return score_population_full(noiser_params, params, c_iter, x, l1b, y)
 
             return jax.lax.map(score_chunk, _chunk_starts).reshape(-1)[:N]
-    trace_startup("jit wrappers ready")
-    trace_profile(cfg.run_name, "jit-wrappers-ready")
+    profiler.log_startup("jit wrappers ready")
 
     def eval_test():
         if n_test_chunks == 0:
-            return float("nan")
+            return float("nan"), None
 
         eval_inputs = test_data[: n_test_chunks * cfg.batch_size]
         eval_labels = test_labels[: n_test_chunks * cfg.batch_size]
@@ -466,10 +724,36 @@ def train(cfg: SNNConfig = None):
             preds = jax.lax.map(eval_one, jnp.arange(n_test_chunks, dtype=jnp.int32)).reshape(-1)
             return jnp.mean(preds == labels)
 
-        return float(eval_batches(noiser_params, params, eval_inputs, eval_labels))
+        def run_eval():
+            return eval_batches(noiser_params, params, eval_inputs, eval_labels)
+
+        if profiler.enabled:
+            eval_acc, total_s = profiler.stage_timed_call(
+                "eval_test_s",
+                run_eval,
+                epoch=epoch_for_eval,
+                global_update=global_update_for_eval,
+            )
+            profiler.record_eval_timing(total_s, n_test_chunks)
+            if profile_snapshot_label:
+                profiler.maybe_snapshot(
+                    profile_snapshot_label,
+                    epoch=epoch_for_eval,
+                    global_update=global_update_for_eval,
+                )
+            return float(eval_acc), {
+                "eval_test_total_s": total_s,
+                "eval_test_chunk_mean_s": total_s / n_test_chunks if n_test_chunks > 0 else 0.0,
+            }
+
+        return float(run_eval()), None
+
+    epoch_for_eval = None
+    global_update_for_eval = None
+    profile_snapshot_label = None
 
     def build_prefetch_queue(start_key, queued_keys=None):
-        trace_startup(
+        profiler.log_startup(
             f"prefetch build begin depth={_prefetch_depth} queued={len(queued_keys or [])}"
         )
         queue = deque()
@@ -481,35 +765,35 @@ def train(cfg: SNNConfig = None):
             batch_keys.append(batch_key)
 
         for batch_key in batch_keys:
-            trace_startup("prefetch sample_and_encode begin")
+            profiler.log_startup("prefetch sample_and_encode begin")
             x_batch, y_batch = sample_and_encode(train_data, train_labels, batch_key)
-            trace_block("prefetch sample_and_encode", x_batch)
-            trace_block("prefetch labels", y_batch)
-            trace_profile(cfg.run_name, "prefetch-batch-ready")
+            profiler.maybe_block("prefetch sample_and_encode", x_batch)
+            profiler.maybe_block("prefetch labels", y_batch)
             queue.append((batch_key, x_batch, y_batch))
-            trace_startup("prefetch batch enqueued")
+            profiler.log_startup("prefetch batch enqueued")
 
-        trace_startup("prefetch build complete")
+        profiler.log_startup("prefetch build complete")
         return queue, next_key
 
     def pop_prefetched_batch(queue, next_key):
         _, x_batch, y_batch = queue.popleft()
         next_key, batch_key = jax.random.split(next_key)
-        trace_startup("next sample_and_encode begin")
+        profiler.log_startup("next sample_and_encode begin", epoch=epoch_context, global_update=global_update)
         next_x, next_y = sample_and_encode(train_data, train_labels, batch_key)
-        trace_block("next sample_and_encode", next_x)
-        trace_block("next labels", next_y)
-        trace_profile(cfg.run_name, "next-batch-ready")
+        profiler.maybe_block("next sample_and_encode", next_x, epoch=epoch_context, global_update=global_update)
+        profiler.maybe_block("next labels", next_y, epoch=epoch_context, global_update=global_update)
+        profiler.maybe_snapshot("next-batch-ready", epoch=epoch_context, global_update=global_update)
         queue.append((batch_key, next_x, next_y))
-        trace_startup("next batch enqueued")
+        profiler.log_startup("next batch enqueued", epoch=epoch_context, global_update=global_update)
         return x_batch, y_batch, queue, next_key
 
-    trace_startup("starting prefetch queue warmup")
+    epoch_context = None
+    profiler.log_startup("starting prefetch queue warmup")
     prefetch_queue, data_key = build_prefetch_queue(data_key, pending_batch_keys)
-    trace_startup("prefetch queue ready")
-    trace_profile(cfg.run_name, "prefetch-ready")
+    profiler.log_startup("prefetch queue ready")
+    profiler.maybe_snapshot("prefetch-ready")
 
-    trace_startup("writing start metric")
+    profiler.log_startup("writing start metric")
     write_metric(
         metrics_path,
         {
@@ -521,19 +805,29 @@ def train(cfg: SNNConfig = None):
             "global_update": global_update,
         },
     )
-    trace_startup("start metric written")
-    trace_profile(cfg.run_name, "start-metric-written")
+    profiler.log_startup("start metric written")
+    profiler.maybe_snapshot("start-metric-written")
 
     # Training loop
     t_start = time.time()
     last_completed_epoch = start_epoch - 1
     try:
         for epoch in range(start_epoch, cfg.num_epochs):
-            trace_startup(f"epoch {epoch} begin")
+            epoch_context = epoch
+            profiler.log_startup(f"epoch {epoch} begin", epoch=epoch, global_update=global_update)
+            epoch_timings = defaultdict(list)
+            eval_stats = None
             for _ in range(cfg.updates_per_epoch):
-                x_batch, y_batch, prefetch_queue, data_key = pop_prefetched_batch(
-                    prefetch_queue, data_key
+                profiler.maybe_start_steady_state_trace(global_update, epoch=epoch)
+                update_start = time.perf_counter()
+                (x_batch, y_batch, prefetch_queue, data_key), sample_encode_s = profiler.stage_timed_call(
+                    "sample_encode_s",
+                    lambda: pop_prefetched_batch(prefetch_queue, data_key),
+                    ready_value=lambda result: (result[0], result[1]),
+                    epoch=epoch,
+                    global_update=global_update,
                 )
+                epoch_timings["sample_encode_s"].append(sample_encode_s)
 
                 # Build iterinfo for population
                 iterinfo = (
@@ -542,10 +836,18 @@ def train(cfg: SNNConfig = None):
                 )
 
                 # Evaluate base params (no noise) on this batch
-                trace_startup("jit_forward_eval begin")
-                val_out = jit_forward_eval(noiser_params, params, x_batch)
-                trace_block("jit_forward_eval", val_out)
-                trace_profile(cfg.run_name, "jit-forward-eval-ready")
+                profiler.log_startup("jit_forward_eval begin", epoch=epoch, global_update=global_update)
+                val_out, forward_eval_s = profiler.stage_timed_call(
+                    "forward_eval_s",
+                    lambda: jit_forward_eval(noiser_params, params, x_batch),
+                    epoch=epoch,
+                    global_update=global_update,
+                )
+                epoch_timings["forward_eval_s"].append(forward_eval_s)
+                if not profiler.startup_trace_stopped:
+                    profiler.maybe_snapshot("jit-forward-eval-ready", epoch=epoch, global_update=global_update)
+                elif profiler.steady_trace_started and not profiler.steady_trace_stopped:
+                    profiler.maybe_snapshot("steady-state-forward-eval-ready", epoch=epoch, global_update=global_update)
                 val_fitness = compute_fitness(val_out, y_batch)
 
                 # Precompute layer 1 base matmul when model exposes linear1
@@ -555,23 +857,36 @@ def train(cfg: SNNConfig = None):
 
                 # Evaluate population (with noise)
                 if _chunk_starts is not None:
-                    trace_startup("score_population_chunked begin")
-                    raw_scores = score_population_chunked(
-                        noiser_params,
-                        params,
-                        iterinfo[0],
-                        iterinfo[1],
-                        x_batch,
-                        l1_base,
-                        y_batch,
+                    profiler.log_startup("score_population_chunked begin", epoch=epoch, global_update=global_update)
+                    raw_scores, population_score_s = profiler.stage_timed_call(
+                        "population_score_s",
+                        lambda: score_population_chunked(
+                            noiser_params,
+                            params,
+                            iterinfo[0],
+                            iterinfo[1],
+                            x_batch,
+                            l1_base,
+                            y_batch,
+                        ),
+                        epoch=epoch,
+                        global_update=global_update,
                     )
                 else:
-                    trace_startup("score_population_full begin")
-                    raw_scores = score_population_full(
-                        noiser_params, params, iterinfo, x_batch, l1_base, y_batch
+                    profiler.log_startup("score_population_full begin", epoch=epoch, global_update=global_update)
+                    raw_scores, population_score_s = profiler.stage_timed_call(
+                        "population_score_s",
+                        lambda: score_population_full(
+                            noiser_params, params, iterinfo, x_batch, l1_base, y_batch
+                        ),
+                        epoch=epoch,
+                        global_update=global_update,
                     )
-                trace_block("population scores", raw_scores)
-                trace_profile(cfg.run_name, "population-scores-ready")
+                epoch_timings["population_score_s"].append(population_score_s)
+                if not profiler.startup_trace_stopped:
+                    profiler.maybe_snapshot("population-scores-ready", epoch=epoch, global_update=global_update)
+                elif profiler.steady_trace_started and not profiler.steady_trace_stopped:
+                    profiler.maybe_snapshot("steady-state-population-scores-ready", epoch=epoch, global_update=global_update)
 
                 fitnesses = EggRoll.convert_fitnesses(
                     frozen_noiser_params, noiser_params, raw_scores
@@ -579,15 +894,23 @@ def train(cfg: SNNConfig = None):
                 raw_score_std = float(jnp.std(raw_scores))
 
                 # Update parameters
-                trace_startup("jit_update begin")
-                noiser_params, params = jit_update(
-                    noiser_params, params, fitnesses, iterinfo
+                profiler.log_startup("jit_update begin", epoch=epoch, global_update=global_update)
+                (noiser_params, params), update_s = profiler.stage_timed_call(
+                    "update_s",
+                    lambda: jit_update(noiser_params, params, fitnesses, iterinfo),
+                    ready_value=lambda result: result[1],
+                    epoch=epoch,
+                    global_update=global_update,
                 )
-                trace_block("jit_update params", params)
-                trace_profile(cfg.run_name, "jit-update-ready")
-                finish_startup_trace("jit-update-ready")
+                epoch_timings["update_s"].append(update_s)
+                if not profiler.startup_trace_stopped:
+                    profiler.maybe_snapshot("jit-update-ready", epoch=epoch, global_update=global_update)
+                elif profiler.steady_trace_started and not profiler.steady_trace_stopped:
+                    profiler.maybe_snapshot("steady-state-jit-update-ready", epoch=epoch, global_update=global_update)
+                profiler.finish_startup_trace("jit-update-ready", epoch=epoch, global_update=global_update)
 
                 # 1/5th success rule: adapt sigma based on fraction beating baseline
+                stats_t0 = time.perf_counter()
                 n_better = int(jnp.sum(raw_scores > val_fitness))
                 success_rate = n_better / N
 
@@ -606,6 +929,10 @@ def train(cfg: SNNConfig = None):
                     noiser_params["sigma"], cfg.sigma_min, cfg.sigma_max
                 )
                 global_update += 1
+                profiler.finish_steady_state_trace(global_update, epoch=epoch)
+                post_update_stats_s = time.perf_counter() - stats_t0
+                epoch_timings["post_update_stats_s"].append(post_update_stats_s)
+                epoch_timings["total_update_s"].append(time.perf_counter() - update_start)
 
             do_log = cfg.log_interval > 0 and epoch % cfg.log_interval == 0
             do_test = cfg.test_interval > 0 and epoch % cfg.test_interval == 0
@@ -618,7 +945,29 @@ def train(cfg: SNNConfig = None):
             updates_per_s = global_update / elapsed if elapsed > 0 and global_update > 0 else 0.0
             avg_update_s = elapsed / global_update if global_update > 0 else 0.0
             avg_epoch_s = elapsed / (epoch - start_epoch + 1) if epoch >= start_epoch else 0.0
-            test_acc = eval_test() if do_test else None
+            epoch_for_eval = epoch
+            global_update_for_eval = global_update
+            profile_snapshot_label = (
+                "steady-state-eval-ready"
+                if profiler.steady_trace_started and not profiler.steady_trace_stopped
+                else None
+            )
+            test_acc, eval_stats = eval_test() if do_test else (None, None)
+
+            if cfg.profile_eval_once and profiler.enabled and not profiler.eval_once_recorded and epoch >= start_epoch:
+                eval_once_acc, eval_once_stats = eval_test()
+                write_metric(
+                    metrics_path,
+                    {
+                        "event": "eval_profile",
+                        "epoch": epoch,
+                        "global_update": global_update,
+                        "eval_test_acc": eval_once_acc,
+                        **(eval_once_stats or {}),
+                        "timestamp": time.time(),
+                    },
+                )
+                profiler.eval_once_recorded = True
 
             record = {
                 "event": "epoch",
@@ -641,6 +990,14 @@ def train(cfg: SNNConfig = None):
                 "test_acc": test_acc,
                 "timestamp": time.time(),
             }
+            record.update(
+                profiler.aggregate_epoch_timings(
+                    epoch_timings,
+                    eval_total_s=(eval_stats or {}).get("eval_test_total_s"),
+                )
+            )
+            if eval_stats:
+                record.update(eval_stats)
             write_metric(metrics_path, record)
 
             if test_acc is not None and test_acc > best_test_acc:
@@ -694,7 +1051,7 @@ def train(cfg: SNNConfig = None):
                 )
             last_completed_epoch = epoch
     except KeyboardInterrupt:
-        finish_startup_trace("keyboard-interrupt")
+        profiler.finish_all_traces("keyboard-interrupt", epoch=last_completed_epoch, global_update=global_update)
         interrupt_path = save_checkpoint(
             checkpoint_dir,
             cfg.run_name,
@@ -713,10 +1070,13 @@ def train(cfg: SNNConfig = None):
         print(f"\nInterrupted. Saved checkpoint: {interrupt_path}")
         raise
     finally:
-        finish_startup_trace("train-finally")
+        profiler.finish_all_traces("train-finally", epoch=last_completed_epoch, global_update=global_update)
 
     # Final test accuracy
-    test_acc = eval_test()
+    epoch_for_eval = last_completed_epoch
+    global_update_for_eval = global_update
+    profile_snapshot_label = None
+    test_acc, _ = eval_test()
     elapsed = time.time() - t_start
 
     save_checkpoint(
@@ -749,6 +1109,7 @@ def train(cfg: SNNConfig = None):
     with summary_path.open("w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2, sort_keys=True)
     write_metric(metrics_path, {"event": "final", **summary})
+    profiler.write_summary()
 
     print(f"\nFinal test accuracy: {test_acc:.4f} | Wall-clock: {elapsed:.1f}s")
 
@@ -803,6 +1164,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test_interval", type=int, default=None)
     parser.add_argument("--checkpoint_interval", type=int, default=None)
     parser.add_argument("--sigma_warmup_epochs", type=int, default=None)
+    parser.add_argument(
+        "--profile_mode",
+        type=str,
+        default=None,
+        choices=["off", "startup", "steady_state", "full"],
+    )
+    parser.add_argument("--profile_trace_dir", type=str, default=None)
+    parser.add_argument("--profile_server_port", type=int, default=None)
+    parser.add_argument("--profile_max_snapshots", type=int, default=None)
+    parser.add_argument("--profile_warmup_updates", type=int, default=None)
+    parser.add_argument("--profile_updates_window", type=int, default=None)
+    parser.add_argument("--profile_eval_once", action="store_true")
+    parser.add_argument(
+        "--profile_sync_timings",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     return parser
 
 
@@ -898,6 +1276,34 @@ def build_config_from_args(args) -> SNNConfig:
             args.sigma_warmup_epochs
             if args.sigma_warmup_epochs is not None
             else base_cfg.sigma_warmup_epochs
+        ),
+        profile_mode=args.profile_mode or base_cfg.profile_mode,
+        profile_trace_dir=args.profile_trace_dir or base_cfg.profile_trace_dir,
+        profile_server_port=(
+            args.profile_server_port
+            if args.profile_server_port is not None
+            else base_cfg.profile_server_port
+        ),
+        profile_max_snapshots=(
+            args.profile_max_snapshots
+            if args.profile_max_snapshots is not None
+            else base_cfg.profile_max_snapshots
+        ),
+        profile_warmup_updates=(
+            args.profile_warmup_updates
+            if args.profile_warmup_updates is not None
+            else base_cfg.profile_warmup_updates
+        ),
+        profile_updates_window=(
+            args.profile_updates_window
+            if args.profile_updates_window is not None
+            else base_cfg.profile_updates_window
+        ),
+        profile_eval_once=args.profile_eval_once,
+        profile_sync_timings=(
+            args.profile_sync_timings
+            if args.profile_sync_timings is not None
+            else base_cfg.profile_sync_timings
         ),
     )
 
