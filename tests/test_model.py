@@ -437,6 +437,11 @@ def test_train_startup_profile_writes_artifacts(monkeypatch, tmp_path):
     assert profile_summary.exists()
     assert any(profile_dir.glob("*.pb"))
     assert any(trace_dir.glob("*"))
+    summary_payload = json.loads(profile_summary.read_text())
+    assert "total_update_s" in summary_payload["stage_timing_summary"]
+    assert summary_payload["bottleneck_ranking"]
+    assert all(item["stage"] != "eval_test" for item in summary_payload["bottleneck_ranking"])
+    assert summary_payload["eval_timing_summary"]["fraction_vs_mean_update"] is not None
     records = [json.loads(line) for line in metrics_path.read_text().splitlines() if line.strip()]
     epoch_record = next(record for record in records if record["event"] == "epoch")
     assert "timing_population_score_mean_s" in epoch_record
@@ -489,6 +494,11 @@ def test_train_steady_state_profile_window_and_paths(monkeypatch, tmp_path):
 
     trace_dir = tmp_path / "logs" / "traces" / "pytest-profile-steady" / "steady_state"
     assert any(trace_dir.glob("*"))
+    summary_payload = json.loads((tmp_path / "logs" / "pytest-profile-steady.profile-summary.json").read_text())
+    assert "total_update_s" in summary_payload["stage_timing_summary"]
+    assert summary_payload["bottleneck_ranking"]
+    assert all(item["fraction"] > 0.0 for item in summary_payload["bottleneck_ranking"])
+    assert all(item["stage"] != "eval_test" for item in summary_payload["bottleneck_ranking"])
 
     metrics_path = tmp_path / "logs" / "pytest-profile-steady.metrics.jsonl"
     epoch_record = next(
@@ -500,6 +510,85 @@ def test_train_steady_state_profile_window_and_paths(monkeypatch, tmp_path):
     assert "timing_population_score_frac" in epoch_record
     assert (tmp_path / "logs" / "pytest-profile-steady.profile-summary.json").exists()
     assert (tmp_path / "ckpts").exists()
+
+
+def test_train_profile_mode_off_does_not_create_profile_dirs(monkeypatch, tmp_path):
+    _install_dummy_dataset(monkeypatch)
+
+    cfg = SNNConfig(
+        dataset="mnist",
+        model_name="mlp_snn",
+        n_inputs=8,
+        hidden_size=4,
+        n_classes=2,
+        timesteps=2,
+        pop_size=4,
+        rank=1,
+        sigma=0.02,
+        sigma_min=0.001,
+        sigma_max=0.005,
+        lr=0.001,
+        batch_size=2,
+        chunk_size=2,
+        num_epochs=1,
+        updates_per_epoch=1,
+        sigma_warmup_epochs=0,
+        log_interval=1,
+        test_interval=0,
+        checkpoint_interval=0,
+        run_name="pytest-profile-off",
+        log_dir=str(tmp_path / "logs"),
+        checkpoint_dir=str(tmp_path / "ckpts"),
+        profile_mode="off",
+    )
+
+    train(cfg)
+
+    assert not (tmp_path / "logs" / "profiles" / "pytest-profile-off").exists()
+    assert not (tmp_path / "logs" / "traces" / "pytest-profile-off").exists()
+
+
+def test_train_profile_trace_dir_override_only_moves_traces(monkeypatch, tmp_path):
+    _install_dummy_dataset(monkeypatch)
+    _install_dummy_profiler(monkeypatch)
+
+    cfg = SNNConfig(
+        dataset="mnist",
+        model_name="mlp_snn",
+        n_inputs=8,
+        hidden_size=4,
+        n_classes=2,
+        timesteps=2,
+        pop_size=4,
+        rank=1,
+        sigma=0.02,
+        sigma_min=0.001,
+        sigma_max=0.005,
+        lr=0.001,
+        batch_size=2,
+        chunk_size=2,
+        num_epochs=1,
+        updates_per_epoch=3,
+        sigma_warmup_epochs=0,
+        log_interval=1,
+        test_interval=0,
+        checkpoint_interval=0,
+        run_name="pytest-profile-trace-override",
+        log_dir=str(tmp_path / "logs"),
+        checkpoint_dir=str(tmp_path / "ckpts"),
+        profile_mode="steady_state",
+        profile_trace_dir=str(tmp_path / "separate-traces"),
+        profile_warmup_updates=1,
+        profile_updates_window=1,
+    )
+
+    train(cfg)
+
+    assert (tmp_path / "logs" / "pytest-profile-trace-override.metrics.jsonl").exists()
+    assert (tmp_path / "logs" / "pytest-profile-trace-override.profile-summary.json").exists()
+    assert (tmp_path / "logs" / "profiles" / "pytest-profile-trace-override").exists()
+    assert not (tmp_path / "logs" / "traces" / "pytest-profile-trace-override").exists()
+    assert (tmp_path / "separate-traces" / "pytest-profile-trace-override" / "steady_state").exists()
 
 
 def test_train_selective_stage_perturbation_emits_metrics(monkeypatch, tmp_path):

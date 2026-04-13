@@ -91,6 +91,26 @@ Long-running jobs now emit:
 - a final summary in `LOG_DIR/<run_name>.summary.json`
 - checkpoints in `CHECKPOINT_DIR/<run_name>-{last,best,interrupt}.pkl`
 
+When profiling is enabled, runs also emit:
+
+- startup markers in `LOG_DIR/<run_name>.startup.jsonl`
+- profiling summary in `LOG_DIR/<run_name>.profile-summary.json`
+- memory profiles in `LOG_DIR/profiles/<run_name>/`
+- traces in `LOG_DIR/traces/<run_name>/...` by default
+
+Trace artifacts can be relocated independently with
+`--profile_trace_dir <dir>`. Metrics, summaries, and memory profiles remain
+under `LOG_DIR`.
+
+Common profiling flags:
+
+- `--profile_mode off|startup|steady_state|full`
+- `--profile_server_port 9999`
+- `--profile_max_snapshots 16`
+- `--profile_warmup_updates <n>`
+- `--profile_updates_window <n>`
+- `--profile_eval_once`
+
 Evaluation note: test accuracy is computed in fixed-size chunks using the training
 batch size; when `10000 % batch_size != 0`, the final partial chunk is dropped to
 avoid extra JIT recompiles.

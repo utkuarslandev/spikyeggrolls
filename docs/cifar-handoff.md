@@ -103,14 +103,20 @@ code-level deadlock.
 - bounded startup trace capture
 - optional profiler server
 
-Useful env vars:
-- `SPIKYEGGROLL_TRACE_STARTUP=1`
-- `SPIKYEGGROLL_PROFILE_STARTUP=1`
-- `SPIKYEGGROLL_PROFILE_MAX_SNAPSHOTS=16`
-- `SPIKYEGGROLL_PROFILE_TRACE=1`
-- `SPIKYEGGROLL_PROFILE_SERVER_PORT=9999`
-- `SPIKYEGGROLL_PROFILE_DIR=...`
-- `SPIKYEGGROLL_TRACE_DIR=...`
+Useful CLI flags now:
+- `--profile_mode startup|steady_state|full`
+- `--profile_server_port 9999`
+- `--profile_max_snapshots 16`
+- `--profile_warmup_updates <n>`
+- `--profile_updates_window <n>`
+- `--profile_eval_once`
+- `--profile_trace_dir <dir>` if trace artifacts should live outside `log_dir`
+
+Default artifact layout:
+- metrics and summaries under `<log_dir>/`
+- memory profiles under `<log_dir>/profiles/<run_name>/`
+- traces under `<log_dir>/traces/<run_name>/...`
+- `--profile_trace_dir` only relocates the trace artifacts
 
 Relevant commits:
 - `fc80b53` `Add startup tracing for CIFAR training hangs`

@@ -171,8 +171,6 @@ class ProfilingController:
         self.profile_root = (self.log_dir / "profiles").resolve()
         self.profile_run_root = self.profile_root / cfg.run_name
         self.trace_run_root = self.trace_root / cfg.run_name
-        self.profile_run_root.mkdir(parents=True, exist_ok=True)
-        self.trace_run_root.mkdir(parents=True, exist_ok=True)
         self.snapshot_count = 0
         self.startup_events = []
         self.overall_stage_timings = defaultdict(list)
@@ -190,8 +188,9 @@ class ProfilingController:
         self.steady_trace_stop_update = cfg.profile_warmup_updates + cfg.profile_updates_window
         self._startup_trace_active = False
         self._steady_trace_active = False
-        self.profile_run_root.mkdir(parents=True, exist_ok=True)
-        self.trace_run_root.mkdir(parents=True, exist_ok=True)
+        if self.enabled:
+            self.profile_run_root.mkdir(parents=True, exist_ok=True)
+            self.trace_run_root.mkdir(parents=True, exist_ok=True)
 
     def _write_startup_record(self, record: dict):
         self.startup_path.parent.mkdir(parents=True, exist_ok=True)
@@ -368,9 +367,12 @@ class ProfilingController:
             value = ready_value(result) if callable(ready_value) else (ready_value if ready_value is not None else result)
             self.maybe_block(stage, value, epoch=epoch, global_update=global_update)
         dt = time.perf_counter() - t0
+        self.record_stage_timing(stage, dt)
+        return result, dt
+
+    def record_stage_timing(self, stage: str, dt: float):
         if self.enabled:
             self.overall_stage_timings[stage].append(dt)
-        return result, dt
 
     def record_eval_timing(self, total_s: float, n_chunks: int):
         if self.enabled:
@@ -442,6 +444,7 @@ class ProfilingController:
             "sample_encode_s",
             "prefix_cache_s",
             "forward_eval_s",
+            "post_update_stats_s",
         ]:
             summary = stage_summary.get(stage)
             if summary and total_mean > 0:
@@ -451,9 +454,6 @@ class ProfilingController:
                         "fraction": summary["mean_s"] / total_mean,
                     }
                 )
-        if self.eval_timings:
-            eval_mean = float(np.mean([item["total_s"] for item in self.eval_timings]))
-            bottlenecks.append({"stage": "eval_test", "fraction": eval_mean / total_mean if total_mean > 0 else 0.0})
         bottlenecks.sort(key=lambda item: item["fraction"], reverse=True)
 
         payload = {
@@ -474,6 +474,11 @@ class ProfilingController:
                 "count": len(self.eval_timings),
                 "mean_total_s": float(np.mean([item["total_s"] for item in self.eval_timings])) if self.eval_timings else None,
                 "mean_chunk_s": float(np.mean([item["chunk_mean_s"] for item in self.eval_timings])) if self.eval_timings else None,
+                "fraction_vs_mean_update": (
+                    float(np.mean([item["total_s"] for item in self.eval_timings])) / total_mean
+                    if self.eval_timings and total_mean > 0
+                    else None
+                ),
             },
             "bottleneck_ranking": bottlenecks,
         }
@@ -1312,7 +1317,10 @@ def train(cfg: SNNConfig = None):
                 profiler.finish_steady_state_trace(global_update, epoch=epoch)
                 post_update_stats_s = time.perf_counter() - stats_t0
                 epoch_timings["post_update_stats_s"].append(post_update_stats_s)
-                epoch_timings["total_update_s"].append(time.perf_counter() - update_start)
+                profiler.record_stage_timing("post_update_stats_s", post_update_stats_s)
+                total_update_s = time.perf_counter() - update_start
+                epoch_timings["total_update_s"].append(total_update_s)
+                profiler.record_stage_timing("total_update_s", total_update_s)
 
             do_log = cfg.log_interval > 0 and epoch % cfg.log_interval == 0
             do_test = cfg.test_interval > 0 and epoch % cfg.test_interval == 0
