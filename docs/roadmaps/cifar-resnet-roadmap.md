@@ -11,12 +11,16 @@ For current results and run-by-run comparisons, see
 - Best completed result so far:
   - `cifar5090-phase3-baseline-batch-kernel-20260413`
   - final test accuracy `28.27%`
+- Best observed result so far:
+  - `cifar5090-2h-batch-kernel-selective-sigmafix`
+  - observed peak test accuracy `30.36%` at `epoch 100`
+  - late dip after sigma pinned at `0.012`
 - Current strongest baseline:
   - `batch + kernel_lora + selective stage perturbation`
   - `pop_size=4096`, `rank=2`, `timesteps=16`, `batch_size=48`, `chunk_size=96`, `dtype=bfloat16`
 - Main remaining bottlenecks:
   - population scoring still dominates wall clock
-  - sigma still collapses late in training
+  - sigma policy is still unstable late in training
   - `bntt` does not clearly beat `batch`
   - current full-model `matrix_lora` is a severe runtime regression
 
@@ -49,15 +53,15 @@ Benchmarked:
 
 ## Remaining Priorities
 
-### 1. Validate the long-run sigma-tuned baseline
+### 1. Retune sigma upper control on top of the working baseline
 
 Target:
-- determine whether the 2-hour `batch + kernel_lora` run with slower sigma decay
-  materially beats the 30-epoch baseline at equal wall-clock or final accuracy
+- keep the long-run benefit from slower sigma decay without letting sigma pin at
+  `0.012` late in training
 
 Decision gate:
-- if it wins, make the sigma-tuned config the new baseline
-- if it does not, keep the current baseline and revisit sigma policy again
+- a revised sigma policy should preserve the `30%+` upside from the 2-hour run
+  while reducing the late accuracy drop after overshoot
 
 ### 2. Improve exploration without hurting the working runtime path
 
@@ -121,6 +125,7 @@ metrics that matter together, not separately.
 Required comparison metrics:
 - final test accuracy
 - checkpoint-best test accuracy
+- best observed long-run test accuracy
 - equal-wall-clock test accuracy
 - `population_score_mean_s`
 - `avg_update_s`
@@ -135,6 +140,8 @@ Default promotion rule:
 
 Current recommended direction:
 1. keep `batch + kernel_lora + selective perturbation` as the baseline
-2. finish evaluating the active 2-hour sigma-tuned run
+2. treat the 2-hour sigma-tuned run as partial success:
+   - it reached `30.36%`
+   - it also showed late sigma overshoot
 3. refine sigma behavior before attempting another major systems rewrite
 4. only revisit `matrix_lora` with a narrowed, stage-limited implementation

@@ -14,22 +14,25 @@ current implementation roadmap, see
 
 ## Current Snapshot
 
-- Current best result:
+- Best completed result:
   - run: `cifar5090-phase3-baseline-batch-kernel-20260413`
   - host: `216.249.100.66:21650`
   - result:
     - final test accuracy: `28.27%`
     - best checkpoint test accuracy: `26.98%` at `epoch 25`
     - `30` logged epochs, `300` updates, `1783.9s`
-- Current active long run:
+- Best observed long-run result so far:
   - run: `cifar5090-2h-batch-kernel-selective-sigmafix`
   - host: `216.249.100.66:21650`
-  - status at last check:
-    - `epoch 6`
-    - `global_update 70`
-    - `epoch 5` test accuracy: `21.53%`
-    - sigma still holding at `0.006`
-    - early-selective throughput improved with profiling off
+  - latest confirmed state before the host stopped accepting SSH:
+    - `epoch 108`
+    - `global_update 1090`
+    - best observed test accuracy: `30.36%` at `epoch 100`
+    - later dip to `28.27%` at `epoch 105`
+    - sigma climbed to and pinned at `0.012`
+  - interpretation:
+    - slower sigma decay helped push past `30%`
+    - the late sigma policy overshot and became too exploratory
 - Current default baseline configuration:
   - `pop_size=4096`
   - `rank=2`
@@ -45,6 +48,7 @@ current implementation roadmap, see
 
 | Role | Run | Key Config | Result |
 |------|-----|------------|--------|
+| Best observed to date | `cifar5090-2h-batch-kernel-selective-sigmafix` | baseline core + slower sigma decay | observed peak `30.36%` at `epoch 100`; final artifact not recovered |
 | Current best overall | `cifar5090-phase3-baseline-batch-kernel-20260413` | `batch + kernel_lora + selective perturbation` | final `28.27%`, checkpoint best `26.98%` |
 | Best pre-Phase-3 reference | `cifar5090-r2-p4096-t16-c32-b48-k96-bf16-trace2-20260412` | `batch=48`, `chunk=96`, `bf16` | best `22.33%` |
 | BNTT comparison | `cifar5090-phase3-bntt-kernel` | `bntt + kernel_lora + selective perturbation` | final `28.17%`, checkpoint best `26.39%` |
@@ -111,7 +115,10 @@ Runtime ordering is now established:
 - The CIFAR conv SNN path is no longer dead or chance-only.
 - The Phase 3 baseline materially improved over the pre-Phase-3 best (`22.33%` -> `28.27%`).
 - `bntt` does not clearly beat `batch` in the current ES regime.
-- Sigma collapse remains a real late-training limiter.
+- Sigma control is still the main optimizer lever:
+  - the shorter baseline decayed to the floor late
+  - the 2-hour sigma-tuned run avoided early collapse and reached `30.36%`
+  - the same 2-hour run later overshot to `sigma_max=0.012` and destabilized
 
 ### Systems
 
@@ -212,7 +219,7 @@ Takeaway:
 
 ## Active Run
 
-Current long run:
+Long-run sigma experiment:
 - `cifar5090-2h-batch-kernel-selective-sigmafix`
 - same proven baseline core with a less collapse-prone sigma schedule:
   - `sigma_warmup_epochs=40`
@@ -223,21 +230,35 @@ Current long run:
   - `sigma_growth=1.01`
   - `profile_mode=off`
 
-Latest observed state:
-- `epoch 6`
-- `global_update 70`
-- `epoch 5` test accuracy: `21.53%`
-- sigma still holding at `0.006`
-- early-selective throughput improved with profiling off:
-  - `avg_update_s ≈ 2.76s`
-  - `updates_per_s ≈ 0.36`
+Latest confirmed state:
+- `epoch 108`
+- `global_update 1090`
+- observed test checkpoints:
+  - `epoch 0`: `13.00%`
+  - `epoch 5`: `21.53%`
+  - `epoch 10`: `23.71%`
+  - `epoch 15`: `26.59%`
+  - `epoch 20`: `25.69%`
+  - `epoch 25`: `25.99%`
+  - `epoch 90`: `29.66%`
+  - `epoch 95`: `29.86%`
+  - `epoch 100`: `30.36%`
+  - `epoch 105`: `28.27%`
+- latest optimizer behavior:
+  - sigma climbed to `0.012` and pinned there
+  - repeated `sigma_action=grow` preceded the late accuracy dip
+- operational note:
+  - the host later stopped accepting SSH, so the final artifact was not recovered
 
 ## Next Steps
 
 Priority order:
-1. let the active 2-hour sigma-tuned run finish
-2. compare equal-wall-clock accuracy against the current `28.27%` baseline
-3. keep `batch + kernel_lora` as the default baseline unless the 2-hour run wins
+1. recover the final 2-hour run artifact if the host becomes reachable again
+2. retune the sigma upper-control policy:
+   - lower `sigma_max`
+   - weaken late growth
+   - widen hold behavior near the target band
+3. keep `batch + kernel_lora` as the default short-run baseline
 4. if `matrix_lora` is revisited, narrow it first:
    - selective phases only
    - late-stage convs only

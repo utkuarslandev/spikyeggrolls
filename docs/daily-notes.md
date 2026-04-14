@@ -268,26 +268,6 @@ done
 | 2048 | 0.340 | 5142 |
 | 1024 | 0.375 | 5000 |
 | 512 | 0.543 | 5479 |
-
----
-
-## April 13 — CIFAR ResNet consolidation notes
-
-Short summary:
-- Phase 2 and Phase 3 codepaths landed and passed local targeted tests.
-- The fresh 5090 baseline `batch + kernel_lora` run finished at `28.27%`.
-- `bntt + kernel_lora` was effectively a wash versus the baseline.
-- `batch + matrix_lora` regressed badly and was killed after the first full-refresh epoch.
-
-Authoritative sources:
-- current CIFAR status and comparisons: [experiments/cifar.md](experiments/cifar.md)
-- current roadmap: [roadmaps/cifar-resnet-roadmap.md](roadmaps/cifar-resnet-roadmap.md)
-
-Operational notes:
-- keep `batch + kernel_lora + selective perturbation` as the active baseline
-- do not benchmark `bntt + matrix_lora` until `matrix_lora` is narrowed and made competitive
-- preserve April 13 as the point where CIFAR experiment reporting moved out of
-  `daily-notes.md` and into the dedicated experiment doc
 | 256 | 0.865 | 7358 |
 | 128 | 0.843 | 4220 |
 | 64 | 0.995 | 9355 |
@@ -318,6 +298,28 @@ Top 3 most impactful (at pop_size=256):
 Note: readout_gain=0.25 actually scored slightly better RMSE (0.556) but with 4x more spikes (18804 vs 4979), suggesting less efficient coding.
 
 ---
+
+## April 13 — CIFAR ResNet consolidation notes
+
+Short summary:
+- Phase 2 and Phase 3 codepaths landed and passed local targeted tests.
+- The fresh 5090 baseline `batch + kernel_lora` run finished at `28.27%`.
+- `bntt + kernel_lora` was effectively a wash versus the baseline.
+- `batch + matrix_lora` regressed badly and was killed after the first full-refresh epoch.
+- The longer sigma-tuned run later reached a best observed `30.36%` at `epoch 100`,
+  then overshot late after sigma pinned at `0.012`.
+
+Authoritative sources:
+- current CIFAR status and comparisons: [experiments/cifar.md](experiments/cifar.md)
+- current roadmap: [roadmaps/cifar-resnet-roadmap.md](roadmaps/cifar-resnet-roadmap.md)
+
+Operational notes:
+- keep `batch + kernel_lora + selective perturbation` as the active short-run baseline
+- treat the 2-hour sigma-tuned run as partial success, not a clean replacement yet
+- retune sigma upper control before attempting another major systems rewrite
+- do not benchmark `bntt + matrix_lora` until `matrix_lora` is narrowed and made competitive
+- preserve April 13 as the point where CIFAR experiment reporting moved out of
+  `daily-notes.md` and into the dedicated experiment doc
 
 ## Key Findings Across All Sessions
 
