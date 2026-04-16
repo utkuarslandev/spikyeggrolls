@@ -540,6 +540,7 @@ def train(cfg: SNNConfig = None):
         rank=cfg.rank,
         use_batched_update=cfg.use_batched_update,
         fitness_shaping=cfg.fitness_shaping,
+        group_size=cfg.group_size,
     )
     profiler.log_startup("noiser init complete")
 
@@ -613,7 +614,7 @@ def train(cfg: SNNConfig = None):
         indices = jax.random.choice(k1, images.shape[0], shape=(_batch_size,), replace=False)
         batch_imgs = images[indices]
         if _do_augment:  # Python bool — evaluated at trace time, dead-code-eliminated if False
-            batch_imgs = _augment_cifar(batch_imgs, k3)
+            batch_imgs = _augment_cifar(batch_imgs, k3, cutmix=_cutmix, cutmix_alpha=_cutmix_alpha)
         spikes = encode_batch_fn(batch_imgs, _timesteps, k2)
         return spikes, labels[indices]
 
@@ -664,6 +665,8 @@ def train(cfg: SNNConfig = None):
 
     # Augmentation: only for CIFAR-10, evaluated at Python trace time (JIT-safe constant)
     _do_augment = cfg.augment and cfg.dataset == "cifar10"
+    _cutmix = cfg.cutmix and _do_augment
+    _cutmix_alpha = cfg.cutmix_alpha
 
     # Precompute layer 1 base: x @ W1.T for all timesteps (shared across population)
     profiler.log_startup("building jit wrappers")
@@ -1591,6 +1594,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--in_channels", type=int, default=None)
     parser.add_argument("--image_size", type=int, default=None)
     parser.add_argument("--augment", action="store_true")
+    parser.add_argument("--cutmix", action="store_true", help="Apply CutMix after flip/crop augmentation")
+    parser.add_argument("--cutmix_alpha", type=float, default=None, help="Beta(alpha,alpha) for CutMix ratio")
+    parser.add_argument("--direct_coding", action="store_true", help="Use direct coding instead of Poisson (set --timesteps 4)")
+    parser.add_argument("--group_size", type=int, default=None, help="Fitness normalization group size (0=global, 2=antithetic pairs)")
+    parser.add_argument("--learnable_neuron_params", action="store_true", help="Make beta/threshold ES-tunable per block")
     parser.add_argument("--num_test_eval_samples", type=int, default=None)
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--log_dir", type=str, default=None)
@@ -1767,6 +1775,11 @@ def build_config_from_args(args) -> SNNConfig:
         in_channels=args.in_channels if args.in_channels is not None else dflt["in_channels"],
         image_size=args.image_size if args.image_size is not None else dflt["image_size"],
         augment=args.augment,
+        cutmix=args.cutmix,
+        cutmix_alpha=args.cutmix_alpha if args.cutmix_alpha is not None else base_cfg.cutmix_alpha,
+        direct_coding=args.direct_coding,
+        group_size=args.group_size if args.group_size is not None else base_cfg.group_size,
+        learnable_neuron_params=args.learnable_neuron_params,
         num_test_eval_samples=(
             args.num_test_eval_samples
             if args.num_test_eval_samples is not None

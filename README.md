@@ -4,14 +4,14 @@ Training spiking neural networks with the EGGROLL evolution strategy in JAX.
 
 ## Results
 
-**93.7% on MNIST** with a 784-128-128-10 feedforward SNN (118K parameters), trained purely with evolution strategies — no backpropagation, no surrogate gradients.
+**94.75% on MNIST** with a 784-128-128-10 feedforward SNN (118K parameters), trained purely with evolution strategies — no backpropagation, no surrogate gradients.
 
 | Method | MNIST Accuracy |
 |--------|---------------|
 | SG-BPTT (baseline) | ~99.5% |
-| **EGGROLL (this work)** | **93.7%** |
+| **EGGROLL (this work)** | **94.75%** |
 
-Best configuration: pop_size=10000, rank=3, sigma=0.007, lr=0.001, 4000 epochs (~60 min on RTX 4080).
+Best validated 400-epoch replication: `pop_size=10000`, `rank=3`, `sigma=0.007`, `lr=0.005`, best `94.75%`, final `94.68%` (~25 min on `74.2.96.55:15177`).
 
 ## Architecture
 
@@ -36,9 +36,9 @@ uv pip install -e ".[cuda13]"
 # uv pip install -e ".[cuda12]"
 # uv pip install -e ".[cpu]"
 
-# Train (best config, ~60 min on RTX 4080)
+# Train (validated MNIST best-shot replication, ~25 min on 74.2.96.55:15177)
 .venv/bin/python -m spikyeggroll.train \
-  --pop_size 10000 --rank 3 --sigma 0.007 --lr 0.001 --epochs 4000
+  --pop_size 10000 --rank 3 --sigma 0.007 --lr 0.005 --epochs 400
 
 # Quick test (~45s)
 .venv/bin/python -m spikyeggroll.train \

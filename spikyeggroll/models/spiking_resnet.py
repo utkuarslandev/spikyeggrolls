@@ -505,6 +505,23 @@ class BasicBlock(Model):
             )
 
         effective_threshold = stage_threshold if stage_threshold is not None else cfg.threshold
+
+        if cfg.learnable_neuron_params:
+            # Add beta and threshold as ES-tunable Parameter entries.
+            # key reuse is safe here because raw_value is provided (no random sampling).
+            beta_init = Parameter.rand_init(
+                k1, None, None, jnp.array(cfg.beta, dtype=jnp.float32), jnp.float32
+            )
+            thresh_init = Parameter.rand_init(
+                k1, None, None, jnp.array(effective_threshold, dtype=jnp.float32), jnp.float32
+            )
+            init = CommonInit(
+                init.frozen_params,
+                {**init.params, "beta": beta_init.params, "threshold": thresh_init.params},
+                {**init.scan_map, "beta": beta_init.scan_map, "threshold": thresh_init.scan_map},
+                {**init.es_map, "beta": beta_init.es_map, "threshold": thresh_init.es_map},
+            )
+
         init = merge_frozen(
             init,
             beta=cfg.beta,
@@ -525,8 +542,13 @@ class BasicBlock(Model):
         norm_training: bool = False,
         collect_bn_stats: bool = False,
     ):
-        beta = common_params.frozen_params["beta"]
-        threshold = common_params.frozen_params["threshold"]
+        if "beta" in common_params.params:
+            # Learnable per-block LIF dynamics — clamp to valid ranges to prevent dead/saturated neurons
+            beta = jnp.clip(call_submodule(Parameter, "beta", common_params), 0.5, 0.995)
+            threshold = jnp.clip(call_submodule(Parameter, "threshold", common_params), 0.1, 3.0)
+        else:
+            beta = common_params.frozen_params["beta"]
+            threshold = common_params.frozen_params["threshold"]
         v1, v2, v_out = state
 
         out = call_submodule(Conv2d, "conv1", common_params, x)

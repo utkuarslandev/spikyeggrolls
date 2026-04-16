@@ -742,3 +742,28 @@ Takeaway:
 4. The current heavy run is the new best-documented CIFAR run and is roughly
    matching the earlier `21.18%` result while using the newer throughput path.
 5. Sigma collapse now looks like the main optimizer-level problem on long runs.
+
+## April 16 — MNIST replication on new host
+
+Host:
+- `74.2.96.55:15177`
+
+Results:
+- `mnist-smoke-p1024-r8-20260416`
+  - `pop=1024`, `rank=8`, `sigma=0.005`, `lr=0.005`, `epochs=20`
+  - final test accuracy: `77.45%`
+- `mnist-baseline-p1024-r8-20260416`
+  - `pop=1024`, `rank=8`, `sigma=0.005`, `lr=0.005`, `epochs=500`
+  - best test accuracy: `87.19%` at `epoch 400`
+  - final test accuracy: `86.42%`
+  - wall-clock: `244.15s`
+- `mnist-replication-p10000-r3-20260416`
+  - `pop=10000`, `rank=3`, `sigma=0.007`, `lr=0.005`, `epochs=400`
+  - best test accuracy: `94.75%` at `epoch 300`
+  - final test accuracy: `94.68%`
+  - wall-clock: `1522.67s`
+
+Takeaway:
+- current MNIST path is healthy and exceeds the older `91.9%` large-pop reference
+- the stronger validated number to cite is now `94.75%`
+- use [experiments/mnist-baseline.md](experiments/mnist-baseline.md) as the authoritative summary

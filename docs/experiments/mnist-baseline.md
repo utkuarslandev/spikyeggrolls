@@ -2,6 +2,42 @@
 
 Can EGGROLL optimize spiking neural networks at all, and how close does it get to surrogate-gradient BPTT on well-understood benchmarks?
 
+## Current Validated Reference
+
+Latest remote replication on `74.2.96.55:15177`:
+
+- run: `mnist-replication-p10000-r3-20260416`
+- config:
+  - `pop_size=10000`
+  - `rank=3`
+  - `sigma=0.007`
+  - `lr=0.005`
+  - `epochs=400`
+- result:
+  - best test accuracy: **94.75%** at `epoch 300`
+  - final test accuracy: **94.68%**
+  - wall-clock: `1522.67s` about `25.4 min`
+
+Smaller-pop validation on the same host:
+
+- run: `mnist-baseline-p1024-r8-20260416`
+- config:
+  - `pop_size=1024`
+  - `rank=8`
+  - `sigma=0.005`
+  - `lr=0.005`
+  - `epochs=500`
+- result:
+  - best test accuracy: **87.19%** at `epoch 400`
+  - final test accuracy: **86.42%**
+  - wall-clock: `244.15s`
+
+Takeaway:
+
+- the current MNIST path is healthy
+- the historical `91.9%` large-pop reference is reproducible and exceeded on current code
+- the stronger validated number to cite now is **94.75%**
+
 ## Architecture
 
 Feedforward SNN (784-128-128-10), LIF neurons, soft reset, rate coding.
@@ -78,7 +114,7 @@ Baseline: ~99.5% (SG-BPTT).
 | fitness shaping | z-scored |
 | sigma adaptation | 1/5th rule (EMA, 1.02×) |
 
-**Best result: 93.7% test accuracy** (4000 epochs, pop=10000, rank=3, lr=0.001, ~60 min on RTX 4080).
+**Legacy long-run result: 93.7% test accuracy** (4000 epochs, pop=10000, rank=3, lr=0.001, ~60 min on RTX 4080).
 All 10 digit classes above 83%. No dead output neurons.
 
 With lr=0.005: 92.4% at epoch 900 (peaks then degrades due to sigma runaway).
@@ -125,6 +161,11 @@ At pop=10000 (400 epochs):
 Large population (10k) was the key breakthrough — it solved the dead output
 neuron problem that plagued all smaller populations. With pop=1024, digit 8
 had 0% accuracy; with pop=10000, all digits above 83%.
+
+April 16 replication update:
+
+- `mnist-replication-p10000-r3-20260416` reached **94.75%** best / **94.68%** final
+- this supersedes the older `91.9%` 400-epoch reference as the current validated baseline
 
 ### Sweep results
 
@@ -174,4 +215,3 @@ Peak during forward:                   ~8.5 GB
 
 Memory dominated by N×B×H tensors, not LoRA rank. 16 GB GPU fits pop=10000
 at rank≤3. Chunked evaluation needed for rank≥4.
-

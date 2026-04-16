@@ -406,7 +406,7 @@ def test_chunked_population_scoring_matches_python_loop():
     assert jnp.allclose(expected, actual, atol=1e-6, rtol=1e-6)
 
 
-def test_identity_block_has_two_state_tensors_and_nonspiking_shortcut():
+def test_identity_block_has_three_state_tensors_and_spiking_output():
     key = jax.random.key(99)
     k1, k2, k3 = jax.random.split(key, 3)
     cfg = SNNConfig(dataset="cifar10", model_name="spiking_resnet18")
@@ -416,14 +416,16 @@ def test_identity_block_has_two_state_tensors_and_nonspiking_shortcut():
     cp = CommonParams(EggRoll, fnp, np_, frozen_params, params, es_tree_key, None)
 
     x = jax.random.uniform(k3, (2, 64, 16, 16))
-    state = (jnp.zeros_like(x), jnp.zeros_like(x))
+    # SEW-ResNet style: state is (v1, v2, v_out) — 3 membrane potentials per block
+    state = (jnp.zeros_like(x), jnp.zeros_like(x), jnp.zeros_like(x))
     out, new_state, stats = BasicBlock._forward(cp, x, state, collect_stats=True)
 
     assert "shortcut" not in params
-    assert len(new_state) == 2
+    assert len(new_state) == 3
     assert out.shape == x.shape
     assert "shortcut_nonzero_fraction" in stats
-    assert jnp.any(out != jnp.floor(out))
+    # Block output is binary spikes (SEW-ResNet style)
+    assert jnp.all((out == 0.0) | (out == 1.0))
 
 
 def test_projection_block_applies_projection_without_shortcut_state():

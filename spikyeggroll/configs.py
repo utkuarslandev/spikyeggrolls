@@ -35,6 +35,7 @@ class SNNConfig:
     lr: float = 0.005
     fitness_shaping: str = "zscore"
     use_batched_update: bool = False
+    group_size: int = 0  # 0 = global normalization; 2 = normalize within antithetic pairs
 
     # Training
     batch_size: int = 256
@@ -64,6 +65,9 @@ class SNNConfig:
     in_channels: int = 1
     image_size: int = 28
     augment: bool = False
+    cutmix: bool = False
+    cutmix_alpha: float = 1.0  # Beta(alpha, alpha) parameter; 1.0 = Uniform
+    direct_coding: bool = False  # use deterministic direct coding instead of Poisson
     num_test_eval_samples: int = 0
 
     # Convolutional spiking ResNet options (CIFAR-10 path)
@@ -80,6 +84,7 @@ class SNNConfig:
     resnet_bntt_affine_bias: bool = False
     conv_es_mode: str = "kernel_lora"
     resnet_threshold_scale: bool = False  # if True, stage i uses threshold * 2**i
+    learnable_neuron_params: bool = False  # if True, beta/threshold are ES-tunable Parameters
     selective_stage_perturbation: bool = False
     stage_perturbation_schedule: str = "head_last_then_last2"
     stage_perturbation_early_fraction: float = 0.30
