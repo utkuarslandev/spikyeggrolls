@@ -546,6 +546,7 @@ def train(cfg: SNNConfig = None):
     start_epoch = 0
     global_update = 0
     ema_success = None
+    prev_perturbation_phase = None
     best_test_acc = float("-inf")
     best_epoch = None
     pending_batch_keys = []
@@ -563,6 +564,11 @@ def train(cfg: SNNConfig = None):
         best_test_acc = float(checkpoint.get("best_test_acc", float("-inf")))
         best_epoch = checkpoint.get("best_epoch")
         print(f"Resuming from {cfg.resume_from} at epoch {start_epoch}")
+        # Seed prev_perturbation_phase so the first resumed epoch doesn't
+        # spuriously reset ema_success when the phase hasn't actually changed.
+        if selective_supported and start_epoch > 0:
+            prev_plan = model_cls.resolve_selective_plan(start_epoch - 1, cfg.num_epochs, cfg)
+            prev_perturbation_phase = prev_plan["phase"]
         write_metric(
             metrics_path,
             {
@@ -685,7 +691,7 @@ def train(cfg: SNNConfig = None):
                     i,
                     x,
                     l1b,
-                    norm_training=True,
+                    norm_training=False,  # use running stats to reduce per-member BN noise
                 ),
                 in_axes=(None, None, 0, None, None),
             )
@@ -822,7 +828,7 @@ def train(cfg: SNNConfig = None):
                     es_tree_key,
                     i,
                     prefix_x,
-                    norm_training=True,
+                    norm_training=False,  # use running stats to reduce per-member BN noise
                 ),
                 in_axes=(None, None, 0, None),
             )
@@ -838,7 +844,7 @@ def train(cfg: SNNConfig = None):
                     es_tree_key,
                     i,
                     prefix_x,
-                    norm_training=True,
+                    norm_training=False,  # use running stats to reduce per-member BN noise
                 ),
                 in_axes=(None, None, 0, None),
             )
@@ -1095,6 +1101,9 @@ def train(cfg: SNNConfig = None):
             if selective_supported:
                 resolved_plan = model_cls.resolve_selective_plan(epoch, cfg.num_epochs, cfg)
                 perturbation_phase = resolved_plan["phase"]
+                if perturbation_phase != prev_perturbation_phase:
+                    ema_success = None  # reset EMA so stale signal from prior phase doesn't corrupt sigma
+                    prev_perturbation_phase = perturbation_phase
                 selective_plan = selective_phase_info[perturbation_phase]
                 active_stage_groups = selective_plan["active_groups"]
                 cache_split = selective_plan["cache_split"]

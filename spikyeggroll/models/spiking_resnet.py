@@ -42,24 +42,6 @@ def _tree_fill_group(tree, group: str):
     return jax.tree_util.tree_map(lambda _: group, tree)
 
 
-def _merge_bn_stats(existing, incoming):
-    if existing is None:
-        return incoming
-    if incoming is None:
-        return existing
-    merged = {}
-    for key in existing.keys() | incoming.keys():
-        if key in existing and key in incoming:
-            if isinstance(existing[key], dict) and isinstance(incoming[key], dict):
-                merged[key] = _merge_bn_stats(existing[key], incoming[key])
-            else:
-                merged[key] = incoming[key]
-        elif key in existing:
-            merged[key] = existing[key]
-        else:
-            merged[key] = incoming[key]
-    return merged
-
 
 def _reduce_bn_stats(stats_tree, norm_kind: str):
     if stats_tree is None:
@@ -545,7 +527,7 @@ class BasicBlock(Model):
     ):
         beta = common_params.frozen_params["beta"]
         threshold = common_params.frozen_params["threshold"]
-        v1, v2 = state
+        v1, v2, v_out = state
 
         out = call_submodule(Conv2d, "conv1", common_params, x)
         out, norm1_stats = _apply_norm(
@@ -586,7 +568,10 @@ class BasicBlock(Model):
             else:
                 shortcut = shortcut_result
 
-        out = shortcut + s2
+        # SEW-ResNet style: apply LIF after shortcut+s2 so block output is binary spikes.
+        # This removes the magnitude mismatch between the unbounded real-valued shortcut
+        # and the binary s2, ensuring all inter-block communication uses spike trains.
+        v_out, out = lif_step(v_out, shortcut + s2, beta, threshold)
         bn_stats = None
         if collect_bn_stats:
             bn_stats = {"norm1": norm1_stats, "norm2": norm2_stats}
@@ -600,7 +585,7 @@ class BasicBlock(Model):
                 "shortcut_nonzero_fraction": jnp.mean(shortcut != 0),
                 "block_output_nonzero_fraction": jnp.mean(out != 0),
             }
-            return out, (v1, v2), stats, bn_stats
+            return out, (v1, v2, v_out), stats, bn_stats
         if collect_stats:
             stats = {
                 "conv1_rate": jnp.mean(s1),
@@ -608,10 +593,10 @@ class BasicBlock(Model):
                 "shortcut_nonzero_fraction": jnp.mean(shortcut != 0),
                 "block_output_nonzero_fraction": jnp.mean(out != 0),
             }
-            return out, (v1, v2), stats
+            return out, (v1, v2, v_out), stats
         if collect_bn_stats:
-            return out, (v1, v2), bn_stats
-        return out, (v1, v2)
+            return out, (v1, v2, v_out), bn_stats
+        return out, (v1, v2, v_out)
 
 
 class SpikingResNet18Model(Model):
@@ -805,7 +790,11 @@ class SpikingResNet18Model(Model):
                 spatial = _conv_out_dim(spatial, 3, stride, 1)
                 shape = (batch_size, out_channels, spatial, spatial)
                 states.append(
-                    (jnp.zeros(shape, dtype=dtype), jnp.zeros(shape, dtype=dtype))
+                    (
+                        jnp.zeros(shape, dtype=dtype),
+                        jnp.zeros(shape, dtype=dtype),
+                        jnp.zeros(shape, dtype=dtype),  # v_out for post-shortcut LIF
+                    )
                 )
         return tuple(states)
 
@@ -865,7 +854,11 @@ class SpikingResNet18Model(Model):
                 spatial = _conv_out_dim(spatial, 3, stride, 1)
                 shape = (batch_size, out_channels, spatial, spatial)
                 states.append(
-                    (jnp.zeros(shape, dtype=dtype), jnp.zeros(shape, dtype=dtype))
+                    (
+                        jnp.zeros(shape, dtype=dtype),
+                        jnp.zeros(shape, dtype=dtype),
+                        jnp.zeros(shape, dtype=dtype),  # v_out for post-shortcut LIF
+                    )
                 )
         return tuple(states)
 

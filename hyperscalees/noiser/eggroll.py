@@ -225,8 +225,9 @@ class EggRoll(Noiser):
     @classmethod
     def _do_updates_original(cls, frozen_noiser_params, noiser_params, params, base_keys, fitnesses, iterinfos, es_map):
         new_grad = jax.tree.map(lambda p, k, m: cls._do_update(p, k, fitnesses, iterinfos, m, noiser_params["sigma"], frozen_noiser_params), params, base_keys, es_map)
-        updates, noiser_params["opt_state"] = frozen_noiser_params["solver"].update(new_grad, noiser_params["opt_state"], params)
-        return noiser_params, optax.apply_updates(params, updates)
+        updates, new_opt_state = frozen_noiser_params["solver"].update(new_grad, noiser_params["opt_state"], params)
+        new_noiser_params = {**noiser_params, "opt_state": new_opt_state}
+        return new_noiser_params, optax.apply_updates(params, updates)
     
     @classmethod
     def _do_updates_batched(cls, frozen_noiser_params, noiser_params, params, base_keys, fitnesses, iterinfos, es_map):
@@ -268,5 +269,6 @@ class EggRoll(Noiser):
         new_grad = tree_unflatten(treedef, new_flat_grads)
         
         # and do the updates
-        updates, noiser_params["opt_state"] = frozen_noiser_params["solver"].update(new_grad, noiser_params["opt_state"], params)
-        return noiser_params, optax.apply_updates(params, updates)
+        updates, new_opt_state = frozen_noiser_params["solver"].update(new_grad, noiser_params["opt_state"], params)
+        new_noiser_params = {**noiser_params, "opt_state": new_opt_state}
+        return new_noiser_params, optax.apply_updates(params, updates)
