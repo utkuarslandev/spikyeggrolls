@@ -438,11 +438,15 @@ def test_projection_block_applies_projection_without_shortcut_state():
     cp = CommonParams(EggRoll, fnp, np_, frozen_params, params, es_tree_key, None)
 
     x = jax.random.uniform(k3, (2, 64, 16, 16))
-    state = (jnp.zeros((2, 128, 8, 8)), jnp.zeros((2, 128, 8, 8)))
+    state = (
+        jnp.zeros((2, 128, 8, 8)),
+        jnp.zeros((2, 128, 8, 8)),
+        jnp.zeros((2, 128, 8, 8)),
+    )
     out, new_state, _ = BasicBlock._forward(cp, x, state, collect_stats=True)
 
     assert "shortcut" in params
-    assert len(new_state) == 2
+    assert len(new_state) == 3
     assert out.shape == (2, 128, 8, 8)
 
 

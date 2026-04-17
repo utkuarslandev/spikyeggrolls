@@ -8,12 +8,7 @@ from pathlib import Path
 
 from spikyeggroll.configs import SNNConfig
 from spikyeggroll.eval import evaluate
-from spikyeggroll.train import (
-    _phase_frozen_noiser_params,
-    build_config_from_args,
-    build_parser,
-    train,
-)
+from spikyeggroll.train import build_config_from_args, build_parser, train
 from spikyeggroll.models.snn import SNNModel
 from spikyeggroll.models.spiking_resnet import SpikingResNet18Model
 from hyperscalees.models.common import simple_es_tree_key
@@ -256,23 +251,6 @@ def test_cli_selective_stage_perturbation_flags_roundtrip():
     assert cfg.stage_perturbation_schedule == "head_last_then_last2"
     assert cfg.stage_perturbation_early_fraction == pytest.approx(0.4)
     assert cfg.stage_perturbation_full_epoch_interval == 6
-
-
-def test_full_refresh_forces_unbatched_update_only_for_that_phase():
-    frozen_noiser_params = {
-        "use_batched_update": True,
-        "rank": 2,
-    }
-
-    early = _phase_frozen_noiser_params(frozen_noiser_params, "early_selective")
-    mid = _phase_frozen_noiser_params(frozen_noiser_params, "mid_selective")
-    full = _phase_frozen_noiser_params(frozen_noiser_params, "full_model_refresh")
-
-    assert early is frozen_noiser_params
-    assert mid is frozen_noiser_params
-    assert full is not frozen_noiser_params
-    assert full["use_batched_update"] is False
-    assert full["rank"] == frozen_noiser_params["rank"]
 
 
 def test_cli_rejects_removed_legacy_resnet_flags():
