@@ -207,10 +207,29 @@ class EggRoll(Noiser):
         }
         update_fn = update_fns[map_classification]
 
-        if len(base_key.shape) == 0:
+        # A single JAX PRNG key may appear either as a typed scalar key
+        # (ndim == 0) or as legacy key data with shape ``(2,)`` (ndim == 1).
+        # Only recurse when the key tree has been scan-split and therefore
+        # carries one or more extra leading axes.
+        if base_key.ndim <= 1:
             new_grad = update_fn(sigma, param, base_key, fitnesses, iterinfos, frozen_noiser_params)
         else:
-            new_grad = jax.lax.scan(lambda _, x: (0, update_fn(sigma, x[0], x[1], fitnesses, iterinfos, frozen_noiser_params)), 0, xs=(param, base_key))[1]
+            new_grad = jax.lax.scan(
+                lambda _, x: (
+                    0,
+                    cls._do_update(
+                        x[0],
+                        x[1],
+                        fitnesses,
+                        iterinfos,
+                        map_classification,
+                        sigma,
+                        frozen_noiser_params,
+                    ),
+                ),
+                0,
+                xs=(param, base_key),
+            )[1]
 
         # return (param + new_grad * lr * jnp.sqrt(fitnesses.size)).astype(param.dtype)
         return -(new_grad * jnp.sqrt(fitnesses.size)).astype(param.dtype)

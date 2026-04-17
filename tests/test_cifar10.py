@@ -701,6 +701,47 @@ def test_selective_update_changes_only_active_stages():
     )
 
 
+@pytest.mark.parametrize("key_factory", [jax.random.key, jax.random.PRNGKey])
+def test_selective_update_supports_typed_and_legacy_keys(key_factory):
+    key = key_factory(1043)
+    k1, k2 = jax.random.split(key)
+    cfg = SNNConfig(
+        dataset="cifar10",
+        model_name="spiking_resnet18",
+        timesteps=3,
+        pop_size=4,
+        rank=1,
+        use_batched_update=True,
+    )
+    frozen_params, params, scan_map, es_map = SpikingResNet18Model.rand_init(k1, cfg)
+    es_tree_key = simple_es_tree_key(params, k2, scan_map)
+    frozen_noiser_params, noiser_params = EggRoll.init_noiser(
+        params,
+        cfg.sigma,
+        cfg.lr,
+        rank=cfg.rank,
+        use_batched_update=cfg.use_batched_update,
+    )
+    active_es_map = SpikingResNet18Model.build_active_es_map(
+        es_map, frozen_params["perturb_group_map"], ("stage3", "head")
+    )
+    iterinfo = (jnp.zeros(cfg.pop_size, dtype=jnp.int32), jnp.arange(cfg.pop_size))
+    fitnesses = jnp.array([1.0, -1.0, 0.5, -0.5], dtype=jnp.float32)
+
+    new_noiser_params, new_params = EggRoll.do_updates(
+        frozen_noiser_params,
+        noiser_params,
+        params,
+        es_tree_key,
+        fitnesses,
+        iterinfo,
+        active_es_map,
+    )
+
+    assert new_params["linear_out"]["weight"].shape == params["linear_out"]["weight"].shape
+    assert float(new_noiser_params["sigma"]) == float(noiser_params["sigma"])
+
+
 def test_conv2d_matrix_lora_matches_kernel_lora_noisy_forward():
     key = jax.random.key(104)
     k1, k2, k3 = jax.random.split(key, 3)
