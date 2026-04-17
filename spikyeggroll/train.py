@@ -882,8 +882,7 @@ def train(cfg: SNNConfig = None):
                     f,
                     i,
                     active_es_map,
-                ),
-                donate_argnums=(0, 1),
+                )
             )
             for phase, phase_info in selective_phase_info.items()
         }
