@@ -22,6 +22,18 @@ from spikyeggroll.data.cifar10 import augment_batch as _augment_cifar
 from spikyeggroll.runtime import get_dataset_spec, get_model_cls
 
 
+def _phase_frozen_noiser_params(frozen_noiser_params: dict, phase: str) -> dict:
+    """Use unbatched updates only for full-model refresh.
+
+    The selective CIFAR path remains fast with batched updates in the selective
+    phases, but the first full refresh is sensitive to XLA layout issues in the
+    batched updater. Keep the fast path everywhere else.
+    """
+    if phase == "full_model_refresh" and frozen_noiser_params["use_batched_update"]:
+        return {**frozen_noiser_params, "use_batched_update": False}
+    return frozen_noiser_params
+
+
 def _tree_to_numpy(tree):
     return jax.tree_util.tree_map(lambda x: np.asarray(x), tree)
 
@@ -855,8 +867,15 @@ def train(cfg: SNNConfig = None):
 
         jit_update_selective = {
             phase: jax.jit(
-                lambda n, p, f, i, active_es_map=phase_info["active_es_map"]: EggRoll.do_updates(
-                    frozen_noiser_params,
+                lambda n,
+                p,
+                f,
+                i,
+                active_es_map=phase_info["active_es_map"],
+                phase_frozen_noiser_params=_phase_frozen_noiser_params(
+                    frozen_noiser_params, phase
+                ): EggRoll.do_updates(
+                    phase_frozen_noiser_params,
                     n,
                     p,
                     es_tree_key,
