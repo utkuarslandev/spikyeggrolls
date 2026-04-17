@@ -28,7 +28,47 @@ fi
 
 source .venv/bin/activate
 
-uv pip install -e "${SPIKYEGGROLL_INSTALL_TARGET}"
+resolve_install_target() {
+    if [ -n "${SPIKYEGGROLL_INSTALL_TARGET:-}" ] && [ "${SPIKYEGGROLL_INSTALL_TARGET}" != "auto" ]; then
+        printf '%s\n' "${SPIKYEGGROLL_INSTALL_TARGET}"
+        return 0
+    fi
+
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        printf '%s\n' '.[cpu]'
+        return 0
+    fi
+
+    printf '%s\n' 'auto-gpu'
+}
+
+install_project() {
+    local install_target="$1"
+
+    if [ "${install_target}" != "auto-gpu" ]; then
+        echo "Installing with target ${install_target}"
+        uv pip install -e "${install_target}"
+        return 0
+    fi
+
+    local targets=('.[cuda13]' '.[cuda12]')
+    local target
+    for target in "${targets[@]}"; do
+        echo "Attempting GPU install target ${target}"
+        if uv pip install -e "${target}"; then
+            export SPIKYEGGROLL_INSTALL_TARGET="${target}"
+            echo "Selected GPU install target ${target}"
+            return 0
+        fi
+        echo "Install target ${target} failed; trying next option."
+    done
+
+    echo "No compatible GPU JAX wheel found; falling back to CPU install."
+    uv pip install -e '.[cpu]'
+    export SPIKYEGGROLL_INSTALL_TARGET='.[cpu]'
+}
+
+install_project "$(resolve_install_target)"
 
 bash "${REPO_ROOT}/scripts/doctor.sh" runpod
 

@@ -78,11 +78,11 @@ DATASET=cifar10 MODEL_NAME=spiking_resnet18 make smoke-runpod
 Both paths run the same Python training entry point through environment profiles in
 `env/local.env` and `env/runpod.env`.
 
-Local bootstrap defaults to the JAX `cuda13` extra via `env/local.env`, and
-`REQUIRE_ACCELERATOR=1` so `make doctor-local` fails if JAX only sees CPU (training
-is intended to run on GPU). For CPU-only machines, set `REQUIRE_ACCELERATOR=0` or
-install with `.[cpu]`. Runpod also defaults to `cuda13` via `env/runpod.env`. Override
-`SPIKYEGGROLL_INSTALL_TARGET` if you need a different JAX wheel.
+Local and Runpod bootstrap now default `SPIKYEGGROLL_INSTALL_TARGET` to `auto`.
+On GPU machines the bootstrap scripts try `.[cuda13]` first, then `.[cuda12]`;
+on machines without `nvidia-smi` they fall back to `.[cpu]`. `REQUIRE_ACCELERATOR=1`
+still means `make doctor-local` fails if JAX only sees CPU. Override
+`SPIKYEGGROLL_INSTALL_TARGET` if you want to force a specific wheel target.
 
 Long-running jobs now emit:
 
