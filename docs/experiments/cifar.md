@@ -250,11 +250,207 @@ Latest confirmed state:
 - operational note:
   - the host later stopped accepting SSH, so the final artifact was not recovered
 
+## Recommended Run Ladder
+
+If the goal is to maximize both accuracy and throughput, do not jump straight to a
+single long run. Use this short elimination ladder and choose the winner by
+equal-wall-clock accuracy.
+
+### Fixed baseline core
+
+Keep these fixed unless a run explicitly changes one of them:
+
+- `dataset=cifar10`
+- `model_name=spiking_resnet18`
+- `pop_size=4096`
+- `rank=2`
+- `lr=0.0015`
+- `updates_per_epoch=10`
+- `batch_size=48`
+- `chunk_size=96`
+- `dtype=bfloat16`
+- `resnet_channels_base=32`
+- `resnet_norm=batch`
+- `conv_es_mode=kernel_lora`
+- `selective_stage_perturbation`
+- `stage_perturbation_schedule=head_last_then_last2`
+- `stage_perturbation_early_fraction=0.30`
+- `stage_perturbation_full_epoch_interval=8`
+- `test_interval=5`
+- `checkpoint_interval=10`
+- `num_test_eval_samples=1024`
+- `profile_mode=off`
+
+### Short-run comparison matrix
+
+Use `epochs=30` for all four runs below.
+
+| Order | Run Name | Changes vs control | Goal | Expected tradeoff |
+|------|-----------|--------------------|------|-------------------|
+| 1 | `cifar-control` | `timesteps=16`, `augment`, current baseline sigma schedule | Re-establish current reference on the target host | Safest known behavior |
+| 2 | `cifar-sigma` | tighter long-run sigma policy only | Test whether better exploration control improves wall-clock accuracy | Highest-confidence improvement path |
+| 3 | `cifar-sigma-cutmix` | `cifar-sigma` + `cutmix`, `cutmix_alpha=1.0` | Test generalization gain from stronger augmentation | Best raw-accuracy upside among new knobs |
+| 4 | `cifar-t12-sigma-cutmix` | `cifar-sigma-cutmix` + `timesteps=12` | Test whether lower T wins on accuracy per hour | Best throughput-adjusted candidate |
+
+Optional fifth run only after the first four:
+
+| Order | Run Name | Changes vs control | Goal | Expected tradeoff |
+|------|-----------|--------------------|------|-------------------|
+| 5 | `cifar-t20-sigma-cutmix` | `cifar-sigma-cutmix` + `timesteps=20` | Test whether more temporal integration beats its cost | Accuracy-biased, slower than `T=16` |
+
+### Recommended sigma policy for the test ladder
+
+Use this policy for `cifar-sigma`, `cifar-sigma-cutmix`, `cifar-t12-sigma-cutmix`, and `cifar-t20-sigma-cutmix`:
+
+- `sigma=0.006`
+- `sigma_warmup_epochs=40`
+- `sigma_min=0.0035`
+- `sigma_max=0.010`
+- `sigma_target_success=0.14`
+- `sigma_success_tolerance=0.04`
+- `sigma_growth=1.005`
+- `sigma_decay=0.995`
+- `sigma_ema_decay=0.90`
+
+Rationale:
+
+- the prior 2-hour run showed that slower sigma decay can push CIFAR past `30%`
+- the same run also showed that `sigma_max=0.012` and faster late growth can overshoot
+- this tighter upper policy keeps the long-horizon idea while reducing late runaway risk
+
+### Suggested commands
+
+Control:
+
+```bash
+.venv/bin/python -m spikyeggroll.train \
+  --dataset cifar10 --model_name spiking_resnet18 \
+  --pop_size 4096 --rank 2 --sigma 0.006 --lr 0.0015 \
+  --epochs 30 --updates_per_epoch 10 \
+  --timesteps 16 --batch_size 48 --chunk_size 96 \
+  --augment --dtype bfloat16 \
+  --resnet_channels_base 32 \
+  --resnet_norm batch \
+  --conv_es_mode kernel_lora \
+  --selective_stage_perturbation \
+  --stage_perturbation_schedule head_last_then_last2 \
+  --stage_perturbation_early_fraction 0.30 \
+  --stage_perturbation_full_epoch_interval 8 \
+  --sigma_warmup_epochs 20 \
+  --test_interval 5 --checkpoint_interval 10 --log_interval 1 \
+  --num_test_eval_samples 1024 \
+  --profile_mode off \
+  --run_name cifar-control
+```
+
+Sigma-only:
+
+```bash
+.venv/bin/python -m spikyeggroll.train \
+  --dataset cifar10 --model_name spiking_resnet18 \
+  --pop_size 4096 --rank 2 --sigma 0.006 --lr 0.0015 \
+  --epochs 30 --updates_per_epoch 10 \
+  --timesteps 16 --batch_size 48 --chunk_size 96 \
+  --augment --dtype bfloat16 \
+  --resnet_channels_base 32 \
+  --resnet_norm batch \
+  --conv_es_mode kernel_lora \
+  --selective_stage_perturbation \
+  --stage_perturbation_schedule head_last_then_last2 \
+  --stage_perturbation_early_fraction 0.30 \
+  --stage_perturbation_full_epoch_interval 8 \
+  --sigma_warmup_epochs 40 \
+  --sigma_min 0.0035 --sigma_max 0.010 \
+  --sigma_target_success 0.14 --sigma_success_tolerance 0.04 \
+  --sigma_growth 1.005 --sigma_decay 0.995 --sigma_ema_decay 0.90 \
+  --test_interval 5 --checkpoint_interval 10 --log_interval 1 \
+  --num_test_eval_samples 1024 \
+  --profile_mode off \
+  --run_name cifar-sigma
+```
+
+Sigma + CutMix:
+
+```bash
+.venv/bin/python -m spikyeggroll.train \
+  --dataset cifar10 --model_name spiking_resnet18 \
+  --pop_size 4096 --rank 2 --sigma 0.006 --lr 0.0015 \
+  --epochs 30 --updates_per_epoch 10 \
+  --timesteps 16 --batch_size 48 --chunk_size 96 \
+  --augment --cutmix --cutmix_alpha 1.0 --dtype bfloat16 \
+  --resnet_channels_base 32 \
+  --resnet_norm batch \
+  --conv_es_mode kernel_lora \
+  --selective_stage_perturbation \
+  --stage_perturbation_schedule head_last_then_last2 \
+  --stage_perturbation_early_fraction 0.30 \
+  --stage_perturbation_full_epoch_interval 8 \
+  --sigma_warmup_epochs 40 \
+  --sigma_min 0.0035 --sigma_max 0.010 \
+  --sigma_target_success 0.14 --sigma_success_tolerance 0.04 \
+  --sigma_growth 1.005 --sigma_decay 0.995 --sigma_ema_decay 0.90 \
+  --test_interval 5 --checkpoint_interval 10 --log_interval 1 \
+  --num_test_eval_samples 1024 \
+  --profile_mode off \
+  --run_name cifar-sigma-cutmix
+```
+
+Timestep-reduced throughput candidate:
+
+```bash
+.venv/bin/python -m spikyeggroll.train \
+  --dataset cifar10 --model_name spiking_resnet18 \
+  --pop_size 4096 --rank 2 --sigma 0.006 --lr 0.0015 \
+  --epochs 30 --updates_per_epoch 10 \
+  --timesteps 12 --batch_size 48 --chunk_size 96 \
+  --augment --cutmix --cutmix_alpha 1.0 --dtype bfloat16 \
+  --resnet_channels_base 32 \
+  --resnet_norm batch \
+  --conv_es_mode kernel_lora \
+  --selective_stage_perturbation \
+  --stage_perturbation_schedule head_last_then_last2 \
+  --stage_perturbation_early_fraction 0.30 \
+  --stage_perturbation_full_epoch_interval 8 \
+  --sigma_warmup_epochs 40 \
+  --sigma_min 0.0035 --sigma_max 0.010 \
+  --sigma_target_success 0.14 --sigma_success_tolerance 0.04 \
+  --sigma_growth 1.005 --sigma_decay 0.995 --sigma_ema_decay 0.90 \
+  --test_interval 5 --checkpoint_interval 10 --log_interval 1 \
+  --num_test_eval_samples 1024 \
+  --profile_mode off \
+  --run_name cifar-t12-sigma-cutmix
+```
+
+### Decision rule
+
+Compare each short run on:
+
+- test accuracy at epochs `5`, `10`, `15`, `20`, `25`, `30`
+- wall-clock runtime
+- best test accuracy
+- sigma trajectory
+
+Rank the candidates by:
+
+1. best test accuracy at equal wall-clock budget
+2. sigma stability
+3. final test accuracy
+4. total runtime
+
+### Recommended long-run candidates
+
+Most likely winners by objective:
+
+- best raw-accuracy shot: `T=16 + sigma + cutmix`
+- best accuracy per hour: `T=12 + sigma + cutmix`
+- safest improved baseline: `T=16 + sigma` without CutMix
+
 ## Next Steps
 
 Priority order:
-1. recover the final 2-hour run artifact if the host becomes reachable again
-2. retune the sigma upper-control policy:
+1. run the short experiment ladder above and choose the winner by equal-wall-clock accuracy
+2. recover the final 2-hour run artifact if the host becomes reachable again
+3. keep retuning the sigma upper-control policy if late overshoot persists:
    - lower `sigma_max`
    - weaken late growth
    - widen hold behavior near the target band
