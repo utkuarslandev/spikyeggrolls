@@ -30,6 +30,10 @@ By default the bootstrap script creates `.venv`, tries the GPU wheel targets in
 order (`cuda13` then `cuda12`), and then runs a hard-failing doctor check that
 requires a non-CPU JAX device.
 
+The install targets are currently pinned to JAX `0.9.2`. That pin is deliberate:
+the CIFAR selective-perturbation ResNet path has been stable there, while replaying
+the same runs under JAX `0.10.0` reproduced an XLA layout/reshape crash.
+
 ## Run commands
 
 Smoke test:
@@ -184,6 +188,7 @@ Available remote targets:
   `torchvision.datasets.MNIST`.
 - Runpod now defaults to auto-detecting the JAX GPU wheel target (`cuda13` then `cuda12`).
   Use `SPIKYEGGROLL_INSTALL_TARGET='.[cuda12]'` or `'.[cuda13]'` to force one.
+- The current `cuda12`, `cuda13`, and `cpu` install targets all pin JAX to `0.9.2`.
 - The Runpod bootstrap now fails if JAX only sees CPU devices. That is intentional.
 - The default full run is expensive. Use `make smoke-runpod` first to verify the Pod,
   CUDA, and dataset path before scaling up.

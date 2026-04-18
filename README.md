@@ -56,6 +56,10 @@ uv pip install -e ".[cuda13]"
 .venv/bin/python -m pytest tests/ -v
 ```
 
+The repo currently pins JAX install targets to `0.9.2`. That is intentional:
+the CIFAR selective-perturbation ResNet runs complete on `0.9.2`, while the same
+path has been reproducing an XLA layout/reshape failure under `0.10.0`.
+
 ## Environment Profiles
 
 The repo now supports shared launchers for both local GPU machines and Runpod Pods:
@@ -83,6 +87,7 @@ On GPU machines the bootstrap scripts try `.[cuda13]` first, then `.[cuda12]`;
 on machines without `nvidia-smi` they fall back to `.[cpu]`. `REQUIRE_ACCELERATOR=1`
 still means `make doctor-local` fails if JAX only sees CPU. Override
 `SPIKYEGGROLL_INSTALL_TARGET` if you want to force a specific wheel target.
+All three install targets currently resolve to JAX `0.9.2`.
 
 Long-running jobs now emit:
 
