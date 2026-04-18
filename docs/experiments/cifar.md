@@ -43,6 +43,15 @@ current implementation roadmap, see
   - `resnet_norm=batch`
   - `conv_es_mode=kernel_lora`
   - selective stage perturbation enabled
+- Current stable JAX target for CIFAR selective runs:
+  - `jax==0.9.2`
+  - `jax 0.10.0` reproduced an XLA layout/reshape crash in the selective
+    `full_model_refresh` path on multiple hosts and historical commits
+- Current training/runtime caution:
+  - medium selective runs are stable on `jax 0.9.2`
+  - very large startup-heavy configs can still spend tens of minutes in compile
+    before epoch `0`, especially when combining large population, large chunks,
+    BNTT, and augmentation-heavy recipes
 
 ## Best Runs
 
@@ -124,6 +133,271 @@ Runtime ordering is now established:
 
 - The current `matrix_lora` implementation is not a speed optimization.
 - The likely loser is the patch-extraction delta path, not VRAM capacity.
+- `jax 0.10.0` is not currently safe for the CIFAR selective ResNet path:
+  - current `main`, `824ae2f`, and `9414039` all reproduced the same
+    `ShapeUtil::ReshapeIsBitcast` failure at the selective `full_model_refresh`
+    boundary when replayed under `jax 0.10.0`
+  - the same medium selective run completed successfully under `jax 0.9.2`
+- The selective `full_model_refresh` phase should use unbatched updates:
+  - removing that override (`6616533`) reintroduced the epoch-8 crash pattern
+  - current `main` restores the phase-specific fallback to
+    `use_batched_update=False` for `full_model_refresh`
+
+## 2026-04-18 Runtime Validation
+
+### JAX version finding
+
+Remote replay on `38.65.239.55:10633` established:
+
+- `jax 0.10.0`:
+  - historical commits that had previously worked (`9414039`, `824ae2f`) still
+    crashed in the same selective path with:
+    - `INTERNAL: RET_CHECK failure`
+    - `layout_normalization.cc`
+    - `ShapeUtil::ReshapeIsBitcast`
+- `jax 0.9.2`:
+  - a medium selective run at `9414039` completed through epoch `8` and epoch
+    `9` without hitting the XLA crash
+
+Takeaway:
+- treat `jax 0.10.0` as a regression for this training path
+- pin CIFAR runs to `jax 0.9.2` until there is an upstream fix or a confirmed
+  local workaround
+
+### Isolated host validation
+
+An isolated clone and venv on `64.228.13.219:61169` was set up under:
+
+- repo: `/workspace/repos/spikyeggrolls-cifar-baseline`
+- data: `/workspace/data/spikyeggrolls-cifar-baseline`
+- logs: `/workspace/logs/spikyeggrolls-cifar-baseline`
+- checkpoints: `/workspace/checkpoints/spikyeggrolls-cifar-baseline`
+- JAX cache: `/workspace/caches/jax-spikyeggrolls-cifar-baseline`
+
+`make bootstrap-runpod` and `make doctor-runpod` both passed there with:
+
+- `jax=0.9.2`
+- `torch=2.11.0+cu130`
+- `torchvision=0.26.0+cu130`
+- `jax_devices=[CudaDevice(id=0)]`
+
+### Smoke validation
+
+Small CIFAR smoke:
+
+- run: `cifar-smoke-small-20260418-host64`
+- config:
+  - `pop_size=32`
+  - `timesteps=4`
+  - `batch_size=8`
+  - `chunk_size=8`
+  - `resnet_channels_base=32`
+- result:
+  - final test accuracy `11.72%`
+  - wall-clock `36.1s`
+
+Takeaway:
+- the isolated host/runtime is valid
+- the CIFAR ResNet path boots, trains, evaluates, and writes checkpoints there
+
+### Demo ladder results
+
+Fixed demo base:
+
+- `pop_size=128`
+- `timesteps=8`
+- `batch_size=16`
+- `chunk_size=16`
+- `resnet_channels_base=32`
+- selective perturbation enabled
+- `10` epochs, `1` update per epoch, `256` test eval samples
+
+Completed results:
+
+| Run | Change | Final test | Notes |
+|-----|--------|------------|-------|
+| `cifar-demo-01-base` | baseline | `11.33%` | stable |
+| `cifar-demo-02-cutmix` | `augment + cutmix` | `8.20%` | worse than base |
+| `cifar-demo-03-bntt` | `resnet_norm=bntt` | `12.50%` | best demo result |
+| `cifar-demo-04-direct` | `direct_coding` | `12.11%` | second-best demo result |
+| `cifar-demo-06-sigma` | adaptive sigma schedule | `11.33%` | no gain over base |
+| `cifar-demo-07-cutmix-bntt` | `cutmix + bntt` | `10.94%` | worse than `bntt` alone |
+| `cifar-demo-08-cutmix-sigma` | `cutmix + sigma` | `8.59%` | worse than base |
+
+Failed demo:
+
+- `cifar-demo-05-learnable`
+  - change: `learnable_neuron_params`
+  - failed before training with dtype mismatch:
+    - `lax.conv_general_dilated requires arguments to have the same dtypes`
+    - `float32` vs `bfloat16`
+
+Takeaways:
+
+- promote:
+  - `bntt`
+  - `direct_coding`
+- do not promote yet:
+  - `cutmix`
+  - sigma schedule
+  - `learnable_neuron_params` (needs a dtype fix first)
+
+### Combined “final big run” behavior
+
+Requested combined recipe:
+
+- `pop_size=8000`
+- `epochs=400`
+- `timesteps=8`
+- `batch_size=48`
+- `chunk_size=128`
+- `resnet_channels_base=32`
+- `resnet_norm=bntt`
+- `augment + cutmix`
+- `direct_coding`
+- sigma schedule enabled
+- selective perturbation enabled
+
+Run:
+
+- `cifar-final-pop8k-bntt-direct-cutmix-sigma`
+
+Observed behavior:
+
+- alive after `~28 minutes`
+- GPU remained fully busy (`~99-100%`, `~24.6 GiB`)
+- stdout was still dominated by Triton/XLA fusion compilation
+- no epoch output yet
+
+Takeaway:
+
+- this config is not obviously dead, but the time-to-first-step is too high for
+  practical iteration
+- use it only after proving a lower-pressure rung such as:
+  - `pop_size=4096`, same rest of config
+  - or `pop_size=8000` with `batch_size=16`, `chunk_size=16`
+
+### Small-model / higher-population scale-up
+
+Remote validation on `210.164.16.102:13146` used an isolated clone and runtime
+under:
+
+- repo: `/workspace/repos/spikyeggrolls-stage1`
+- data: `/workspace/data/spikyeggrolls-stage1`
+- logs: `/workspace/logs/spikyeggrolls-stage1`
+- checkpoints: `/workspace/checkpoints/spikyeggrolls-stage1`
+- JAX cache: `/workspace/caches/jax-spikyeggrolls-stage1`
+
+Both runs below used:
+
+- `jax 0.9.2`
+- `resnet_channels_base=16`
+- `timesteps=8`
+- `batch_size=48`
+- `chunk_size=128`
+- `resnet_norm=bntt`
+- `direct_coding`
+- sigma schedule enabled
+- selective perturbation enabled
+
+#### Stage 1: `pop_size=4096`
+
+Run:
+
+- `cifar-stage1-ch16-pop4096-bntt-direct`
+
+Observed behavior:
+
+- cleared startup normally
+- steady-state throughput around `1.0 upd/s`
+- stable throughout training
+- meaningful learning, then clear rollover
+
+Observed test checkpoints:
+
+- `epoch 0`: `8.93%`
+- `epoch 10`: `13.69%`
+- `epoch 20`: `16.27%`
+- `epoch 30`: `18.35%`
+- `epoch 40`: `20.24%`
+- `epoch 50`: `20.34%`
+- `epoch 60`: `21.23%`
+- `epoch 70`: `21.13%`
+- `epoch 80`: `21.33%`
+- `epoch 90`: `21.13%`
+- `epoch 100`: `21.13%`
+- `epoch 110`: `19.84%`
+- `epoch 120`: `19.84%`
+- `epoch 130`: `19.25%`
+- `epoch 140`: `18.95%`
+- `epoch 150`: `19.44%`
+- `epoch 160`: `18.95%`
+
+Takeaway:
+
+- viable and practical
+- best useful checkpoint: `21.33%` at `epoch 80`
+- running past `epoch 80-100` was not worthwhile; the run had already peaked
+
+#### Stage 2: `pop_size=8000`
+
+Run:
+
+- `cifar-stage2-ch16-pop8000-bntt-direct`
+
+Observed behavior:
+
+- much heavier startup/compile than Stage 1
+- eventually entered training successfully
+- slower steady-state throughput, around `0.55-0.73 upd/s`
+- clearly better best accuracy than Stage 1
+- later rollover again after the best checkpoint
+
+Observed test checkpoints:
+
+- `epoch 0`: `9.03%`
+- `epoch 10`: `14.29%`
+- `epoch 20`: `19.94%`
+- `epoch 30`: `20.04%`
+- `epoch 40`: `22.02%`
+- `epoch 50`: `21.92%`
+- `epoch 60`: `21.63%`
+- `epoch 70`: `22.42%`
+- `epoch 80`: `23.81%`
+- `epoch 90`: `21.23%`
+- `epoch 100`: `20.73%`
+
+Sigma behavior:
+
+- by `epoch 80`, sigma was still moderate at about `0.00499`
+- after that it climbed hard:
+  - `epoch 90`: `0.00457`
+  - `epoch 95`: `0.00811`
+  - `epoch 100`: `0.00985`
+  - `epoch 102+`: pinned at `sigma_max = 0.01200`
+
+Takeaway:
+
+- `pop_size=8000` beat `pop_size=4096`
+- best useful checkpoint: `23.81%` at `epoch 80`
+- the extra population bought about `+2.5` absolute points over Stage 1 peak
+- the current sigma schedule becomes too exploratory late and likely contributes
+  to the post-peak decline
+
+Recommendation from the scale-up comparison:
+
+- keep the Stage 2 core recipe as the strongest current small-model direction:
+  - `resnet_channels_base=16`
+  - `pop_size=8000`
+  - `resnet_norm=bntt`
+  - `direct_coding`
+  - `timesteps=8`
+  - `batch_size=48`
+  - `chunk_size=128`
+- but revise the sigma policy before the next long run:
+  - lower `sigma_max`
+  - reduce `sigma_growth`
+  - avoid late-stage drift to the exploration ceiling
 
 ## Completed Comparisons
 
