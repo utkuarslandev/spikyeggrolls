@@ -16,7 +16,7 @@ from spikyeggroll.models.spiking_resnet import (
     Conv2d,
     SpikingResNet18Model,
 )
-from spikyeggroll.train import compute_fitness
+from spikyeggroll.train import _phase_frozen_noiser_params, compute_fitness
 from spikyeggroll.models.snn import SNNModel
 
 
@@ -744,6 +744,20 @@ def test_selective_update_supports_typed_and_legacy_keys(key_factory):
 
     assert new_params["linear_out"]["weight"].shape == params["linear_out"]["weight"].shape
     assert float(new_noiser_params["sigma"]) == float(noiser_params["sigma"])
+
+
+def test_full_refresh_uses_unbatched_updates_only_for_that_phase():
+    frozen = {"use_batched_update": True, "solver": object()}
+
+    early = _phase_frozen_noiser_params(frozen, "early_selective")
+    mid = _phase_frozen_noiser_params(frozen, "mid_selective")
+    full = _phase_frozen_noiser_params(frozen, "full_model_refresh")
+
+    assert early is frozen
+    assert mid is frozen
+    assert full is not frozen
+    assert full["use_batched_update"] is False
+    assert full["solver"] is frozen["solver"]
 
 
 def test_conv2d_matrix_lora_matches_kernel_lora_noisy_forward():
